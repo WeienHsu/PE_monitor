@@ -161,15 +161,13 @@ def pe_band_chart(ticker: str, config: dict) -> go.Figure | None:
         title=f"{ticker} — 歷史 {metric_name} Band + 股價（{years} 年）",
         xaxis=dict(title="日期", showgrid=False),
         yaxis=dict(
-            title=metric_name,
-            titlefont=dict(color="#2c7bb6"),
+            title=dict(text=metric_name, font=dict(color="#2c7bb6")),
             tickfont=dict(color="#2c7bb6"),
             showgrid=True,
             gridcolor="rgba(0,0,0,0.06)",
         ),
         yaxis2=dict(
-            title="股價 (USD)",
-            titlefont=dict(color="#e67e22"),
+            title=dict(text="股價 (USD)", font=dict(color="#e67e22")),
             tickfont=dict(color="#e67e22"),
             overlaying="y",
             side="right",
