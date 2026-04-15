@@ -145,6 +145,25 @@ def scan_ticker(ticker: str, config: dict) -> dict:
         result["composite_signal"] = result["signal"]
         result["composite_display"] = result["signal_display"]
 
+    # 5. Strategy D 技術訊號（KD 低檔金叉 + MACD 柱狀圖收斂）
+    sd_cfg = settings.get("strategy_d", {})
+    if sd_cfg.get("enabled", False):
+        from src.technical_signals import compute_strategy_d  # lazy import：未啟用時不需 pandas-ta
+        sd = compute_strategy_d(
+            ticker,
+            data_dir,
+            kd_window=sd_cfg.get("kd_window", 10),
+            n_bars=sd_cfg.get("n_bars", 3),
+            recovery_pct=sd_cfg.get("recovery_pct", 0.7),
+        )
+        result["strategy_d_signal"] = sd["signal"]
+        result["strategy_d_dates"]  = sd["signal_dates"]
+        result["strategy_d_error"]  = sd["error"]
+    else:
+        result["strategy_d_signal"] = None   # None = 功能未啟用
+        result["strategy_d_dates"]  = []
+        result["strategy_d_error"]  = None
+
     return result
 
 
@@ -201,6 +220,7 @@ def save_daily_report(results: list[dict], report_dir: str = "reports") -> str:
                 "news_label": (r.get("news_sentiment") or {}).get("label", ""),
                 "composite_signal": r.get("composite_signal", r.get("signal", "")),
                 "composite_display": r.get("composite_display", r.get("signal_display", "")),
+                "strategy_d_signal": r.get("strategy_d_signal"),
             }
         )
     df = pd.DataFrame(rows)
