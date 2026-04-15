@@ -604,6 +604,91 @@ def page_history(config: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Settings page
+# ---------------------------------------------------------------------------
+
+def page_settings(config: dict) -> None:
+    st.header("⚙️ 策略設置")
+    settings = config["settings"]
+
+    # ── 基本面設置 ──────────────────────────────────────────────────────────
+    st.subheader("基本面（PE/PB 百分位）")
+    with st.form("fundamental_form"):
+        entry_pct = st.slider(
+            "進場百分位（低於此值 = BUY）", 5, 45,
+            value=settings.get("entry_percentile", 25), step=5,
+            help="當前 PE/PB 百分位低於此值時，訊號顯示為 BUY",
+        )
+        exit_pct = st.slider(
+            "出場百分位（高於此值 = SELL）", 55, 95,
+            value=settings.get("exit_percentile", 75), step=5,
+            help="當前 PE/PB 百分位高於此值時，訊號顯示為 SELL",
+        )
+        if st.form_submit_button("儲存基本面設置"):
+            settings["entry_percentile"] = entry_pct
+            settings["exit_percentile"] = exit_pct
+            save_config(config)
+            st.cache_data.clear()
+            st.success("已儲存，下次掃描時生效")
+
+    st.markdown("---")
+
+    # ── Strategy D 設置 ──────────────────────────────────────────────────────
+    st.subheader("Strategy D 技術訊號（KD + MACD）")
+    sd = settings.get("strategy_d", {})
+    with st.form("strategy_d_form"):
+        enabled = st.toggle(
+            "啟用 Strategy D",
+            value=sd.get("enabled", False),
+            help="啟用後掃描時計算 KD+MACD 收斂訊號（需安裝 pandas-ta）",
+        )
+
+        st.markdown("**KD 金叉條件**")
+        col1, col2 = st.columns(2)
+        kd_window = col1.slider(
+            "回顧視窗 n（根）",
+            min_value=3, max_value=30,
+            value=int(sd.get("kd_window", 10)),
+            help="在最近 n 根 K 棒內，只要曾出現金叉即算符合條件",
+        )
+        kd_k_threshold = col2.slider(
+            "K 值門檻 m",
+            min_value=10, max_value=40,
+            value=int(sd.get("kd_k_threshold", 20)),
+            help="金叉時 K 值須低於 m（例如 20 = 超賣區，放寬可設 30）",
+        )
+
+        st.markdown("**MACD 柱狀圖收斂條件**")
+        col3, col4 = st.columns(2)
+        n_bars = col3.slider(
+            "收斂根數",
+            min_value=2, max_value=6,
+            value=int(sd.get("n_bars", 3)),
+            help="連續幾根柱狀圖為負且逐漸縮小（越大越嚴格）",
+        )
+        recovery_pct = col4.slider(
+            "回彈比例門檻",
+            min_value=0.3, max_value=0.9,
+            value=float(sd.get("recovery_pct", 0.7)),
+            step=0.05, format="%.2f",
+            help="最新柱狀圖須從谷底回彈達此比例（例如 0.7 = 回彈 70%，越大越嚴格）",
+        )
+
+        if st.form_submit_button("儲存 Strategy D 設置"):
+            settings["strategy_d"] = {
+                "enabled": enabled,
+                "kd_window": kd_window,
+                "kd_k_threshold": kd_k_threshold,
+                "n_bars": n_bars,
+                "recovery_pct": recovery_pct,
+            }
+            save_config(config)
+            st.cache_data.clear()
+            st.success("已儲存，下次掃描時生效")
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -615,7 +700,7 @@ def main() -> None:
     st.sidebar.markdown("---")
     page = st.sidebar.radio(
         "頁面",
-        ["自選股管理", "每日監測儀表板", "歷史報告"],
+        ["自選股管理", "每日監測儀表板", "歷史報告", "⚙️ 策略設置"],
         index=1,
     )
     st.sidebar.markdown("---")
@@ -664,6 +749,8 @@ def main() -> None:
         page_dashboard(config)
     elif page == "歷史報告":
         page_history(config)
+    elif page == "⚙️ 策略設置":
+        page_settings(config)
 
 
 if __name__ == "__main__":

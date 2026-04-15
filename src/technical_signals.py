@@ -116,16 +116,16 @@ def detect_macd_hist_converging(df: pd.DataFrame, n_bars: int = 3, recovery_pct:
     return abs(recent.iloc[-1]) < threshold
 
 
-def _build_kd_prefilter_mask(df: pd.DataFrame, window: int = 10) -> pd.Series:
+def _build_kd_prefilter_mask(df: pd.DataFrame, window: int = 10, kd_k_threshold: int = 20) -> pd.Series:
     """
     建立 KD 低檔金叉前置過濾遮罩。
 
-    對每一列，若該列本身或往前 window 根內曾出現 KD 低檔金叉（K<20 且 K 由下穿上 D），
+    對每一列，若該列本身或往前 window 根內曾出現 KD 低檔金叉（K<kd_k_threshold 且 K 由下穿上 D），
     則該位置為 True。
     """
     k = df["K"]
     d = df["D"]
-    kd_signal = (k.shift(1) < d.shift(1)) & (k > d) & (k < 20)
+    kd_signal = (k.shift(1) < d.shift(1)) & (k > d) & (k < kd_k_threshold)
 
     mask = pd.Series(False, index=df.index)
     for offset in range(0, window + 1):
@@ -138,13 +138,14 @@ def detect_macd_converging_kd_prefilter(
     kd_window: int = 10,
     n_bars: int = 3,
     recovery_pct: float = 0.7,
+    kd_k_threshold: int = 20,
 ) -> bool:
     """
     Strategy D — 偵測「KD 前置過濾 + MACD 柱狀圖收斂」訊號。
 
     條件（兩者皆須成立）：
         1. 今日出現 MACD 柱狀圖收斂（連續 n_bars 日負數收斂，回彈達 recovery_pct）
-        2. 今日或往前 kd_window 根內曾出現 KD 低檔黃金交叉（K<20）
+        2. 今日或往前 kd_window 根內曾出現 KD 低檔黃金交叉（K<kd_k_threshold）
     """
     required = {"K", "D", "histogram"}
     if not required.issubset(df.columns):
@@ -156,7 +157,7 @@ def detect_macd_converging_kd_prefilter(
     window_df = df.iloc[-(kd_window + 1):]
     k = window_df["K"]
     d = window_df["D"]
-    kd_fired = ((k.shift(1) < d.shift(1)) & (k > d) & (k < 20)).any()
+    kd_fired = ((k.shift(1) < d.shift(1)) & (k > d) & (k < kd_k_threshold)).any()
     return bool(kd_fired)
 
 
@@ -169,6 +170,7 @@ def scan_macd_converging_kd_prefilter(
     kd_window: int = 10,
     n_bars: int = 3,
     recovery_pct: float = 0.7,
+    kd_k_threshold: int = 20,
 ) -> pd.DataFrame:
     """
     Strategy D — 掃描 MACD 柱狀圖收斂訊號，只保留 KD 低檔金叉後 kd_window 根內的訊號。
@@ -206,7 +208,7 @@ def scan_macd_converging_kd_prefilter(
     if converging_idxs:
         converging_mask.iloc[list(converging_idxs)] = True
 
-    kd_mask = _build_kd_prefilter_mask(df, window=kd_window)
+    kd_mask = _build_kd_prefilter_mask(df, window=kd_window, kd_k_threshold=kd_k_threshold)
     signal = converging_mask & kd_mask
 
     cols = [c for c in ["date", "close", "K", "D", "macd_line", "signal_line", "histogram"]
@@ -224,18 +226,20 @@ def compute_strategy_d(
     kd_window: int = 10,
     n_bars: int = 3,
     recovery_pct: float = 0.7,
+    kd_k_threshold: int = 20,
     **kwargs,
 ) -> dict:
     """
     為單一股票計算 Strategy D 訊號，使用已快取的價格資料。
 
     參數：
-        ticker       - 股票代號（與 PE Monitor watchlist 相同格式）
-        data_dir     - 快取目錄（對應 config["settings"]["data_dir"]）
-        kd_window    - KD 金叉後等待 MACD 訊號的最大根數，預設 10
-        n_bars       - MACD 柱狀圖連續收斂根數，預設 3
-        recovery_pct - 從谷底回彈比例門檻，預設 0.7
-        **kwargs     - 吸收額外參數（例如 config 中的 enabled 欄位）
+        ticker          - 股票代號（與 PE Monitor watchlist 相同格式）
+        data_dir        - 快取目錄（對應 config["settings"]["data_dir"]）
+        kd_window       - KD 金叉後等待 MACD 訊號的最大根數，預設 10
+        n_bars          - MACD 柱狀圖連續收斂根數，預設 3
+        recovery_pct    - 從谷底回彈比例門檻，預設 0.7
+        kd_k_threshold  - KD 金叉時 K 值須低於此門檻，預設 20
+        **kwargs        - 吸收額外參數（例如 config 中的 enabled 欄位）
 
     回傳：
         {
@@ -271,12 +275,14 @@ def compute_strategy_d(
 
         # 今日訊號（最新一根）
         signal = detect_macd_converging_kd_prefilter(
-            df, kd_window=kd_window, n_bars=n_bars, recovery_pct=recovery_pct
+            df, kd_window=kd_window, n_bars=n_bars,
+            recovery_pct=recovery_pct, kd_k_threshold=kd_k_threshold
         )
 
         # 歷史訊號日期（供圖表標記）
         signal_df = scan_macd_converging_kd_prefilter(
-            df, kd_window=kd_window, n_bars=n_bars, recovery_pct=recovery_pct
+            df, kd_window=kd_window, n_bars=n_bars,
+            recovery_pct=recovery_pct, kd_k_threshold=kd_k_threshold
         )
         signal_dates: list[str] = []
         if not signal_df.empty and "date" in signal_df.columns:
