@@ -125,21 +125,14 @@ def build_historical_pe_series(
     if quarterly_eps.empty:
         return pd.Series(dtype=float)
 
-    # Handle MultiIndex columns from yfinance download
-    if isinstance(prices.columns, pd.MultiIndex):
-        close_col = ("Close", ticker)
-        if close_col in prices.columns:
-            price_series = prices[close_col].dropna()
-        else:
-            try:
-                price_series = prices["Close"].squeeze().dropna()
-            except Exception:
-                return pd.Series(dtype=float)
-    else:
-        price_series = prices["Close"].dropna()
+    # fetch_price_history guarantees flat columns; use to_numeric as safety net
+    if "Close" not in prices.columns:
+        return pd.Series(dtype=float)
+    price_series = pd.to_numeric(prices["Close"], errors="coerce").dropna()
+    if price_series.empty:
+        return pd.Series(dtype=float)
 
-    # Ensure float dtype and tz-naive DatetimeIndex for safe comparison
-    price_series = price_series.astype(float)
+    # Normalise both indices to tz-naive for safe date comparison
     price_series.index = _to_tz_naive(pd.to_datetime(price_series.index))
     quarterly_eps = quarterly_eps.copy()
     quarterly_eps.index = _to_tz_naive(pd.to_datetime(quarterly_eps.index))
@@ -193,16 +186,11 @@ def build_historical_pb_series(
     if prices.empty:
         return pd.Series(dtype=float)
 
-    if isinstance(prices.columns, pd.MultiIndex):
-        close_col = ("Close", ticker)
-        if close_col in prices.columns:
-            price_series = prices[close_col].dropna()
-        else:
-            price_series = prices["Close"].squeeze().dropna()
-    else:
-        price_series = prices["Close"].dropna()
-
-    price_series = price_series.astype(float)
+    if "Close" not in prices.columns:
+        return pd.Series(dtype=float)
+    price_series = pd.to_numeric(prices["Close"], errors="coerce").dropna()
+    if price_series.empty:
+        return pd.Series(dtype=float)
     price_series.index = _to_tz_naive(pd.to_datetime(price_series.index))
     pb_series = (price_series / float(bvps)).rename("PB")
     pb_series.to_csv(cache, header=True)

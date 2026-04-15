@@ -7,7 +7,6 @@ import json
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -21,6 +20,42 @@ def _is_stale(path: Path, max_age_hours: int = 6) -> bool:
         return True
     age = datetime.now() - datetime.fromtimestamp(path.stat().st_mtime)
     return age > timedelta(hours=max_age_hours)
+
+
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalise yfinance MultiIndex columns to simple flat names.
+
+    yfinance >= 0.2.x returns columns like:
+        MultiIndex([('Close', 'GOOGL'), ('High', 'GOOGL'), ...])
+    or (newer):
+        MultiIndex([('Price', 'Close'), ('Price', 'High'), ...])
+
+    We keep only the first level that contains the metric name.
+    """
+    if not isinstance(df.columns, pd.MultiIndex):
+        return df
+    # First level is the metric (Close, High, …); second is ticker or vice-versa.
+    # Heuristic: the metric level contains standard OHLCV names.
+    ohlcv = {"Close", "Open", "High", "Low", "Volume", "Adj Close",
+              "Dividends", "Stock Splits"}
+    l0 = set(df.columns.get_level_values(0))
+    l1 = set(df.columns.get_level_values(1))
+    if len(l0 & ohlcv) >= len(l1 & ohlcv):
+        df.columns = df.columns.get_level_values(0)
+    else:
+        df.columns = df.columns.get_level_values(1)
+    # Drop duplicate columns that may arise (e.g. two 'GOOGL' columns)
+    df = df.loc[:, ~df.columns.duplicated()]
+    return df
+
+
+def _is_valid_price_df(df: pd.DataFrame) -> bool:
+    """Return True if the DataFrame has a usable numeric Close column."""
+    if df.empty or "Close" not in df.columns:
+        return False
+    close_numeric = pd.to_numeric(df["Close"].dropna().head(10), errors="coerce")
+    return close_numeric.notna().any()
 
 
 def fetch_info(ticker: str, data_dir: str = "data") -> dict:
@@ -69,18 +104,35 @@ def fetch_price_history(
     data_dir: str = "data",
 ) -> pd.DataFrame:
     """
-    Return daily OHLCV history for the past `years` years.
-    Cached to {ticker}_history.csv (refreshed every 6 h).
+    Return daily OHLCV history for the past `years` years with flat column names.
+    Cached to {ticker}_price_history.csv (refreshed every 6 h).
+
+    Columns are always flat strings: Close, Open, High, Low, Volume.
+    MultiIndex columns from yfinance are normalised before saving.
     """
     cache = _cache_path(data_dir, ticker, "price_history.csv")
     if not _is_stale(cache, max_age_hours=6):
-        return pd.read_csv(cache, index_col=0, parse_dates=True)
+        df = pd.read_csv(cache, index_col=0, parse_dates=True)
+        if _is_valid_price_df(df):
+            return df
+        # Cached file is mangled (MultiIndex saved as multi-row header).
+        # Delete it so we re-fetch cleanly.
+        cache.unlink(missing_ok=True)
+
     try:
         end = date.today()
         start = end - timedelta(days=365 * years + 30)
-        df = yf.download(ticker, start=start.isoformat(), end=end.isoformat(), progress=False)
+        df = yf.download(
+            ticker,
+            start=start.isoformat(),
+            end=end.isoformat(),
+            progress=False,
+            auto_adjust=True,
+        )
         if df is None or df.empty:
             return pd.DataFrame()
+        # Normalise MultiIndex → flat column names before saving
+        df = _flatten_columns(df)
         Path(data_dir).mkdir(parents=True, exist_ok=True)
         df.to_csv(cache)
         return df
@@ -111,21 +163,10 @@ def fetch_shares_outstanding(ticker: str, data_dir: str = "data") -> float | Non
 def get_latest_close(ticker: str, data_dir: str = "data") -> float | None:
     """Return today's (or most recent) closing price."""
     df = fetch_price_history(ticker, years=1, data_dir=data_dir)
-    if df.empty:
+    if df.empty or "Close" not in df.columns:
         return None
-    # Handle MultiIndex columns from yfinance
-    if isinstance(df.columns, pd.MultiIndex):
-        close_col = ("Close", ticker)
-        if close_col in df.columns:
-            return float(df[close_col].dropna().iloc[-1])
-        # Try first level
-        try:
-            return float(df["Close"].iloc[-1].item())
-        except Exception:
-            pass
-    if "Close" in df.columns:
-        return float(df["Close"].dropna().iloc[-1])
-    return None
+    close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    return float(close.iloc[-1]) if not close.empty else None
 
 
 def is_etf(ticker: str, data_dir: str = "data") -> bool:
