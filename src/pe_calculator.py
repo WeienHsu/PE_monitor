@@ -95,8 +95,17 @@ def build_historical_pe_series(
     """
     cache = Path(data_dir) / f"{ticker}_pe_series.csv"
     if cache.exists():
-        s = pd.read_csv(cache, index_col=0, parse_dates=True).squeeze()
-        return s
+        try:
+            df = pd.read_csv(cache, index_col=0, parse_dates=True)
+            if df.empty:
+                cache.unlink(missing_ok=True)
+            else:
+                s = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna()
+                if not s.empty:
+                    return s
+                cache.unlink(missing_ok=True)
+        except Exception:
+            cache.unlink(missing_ok=True)
 
     prices = fetch_price_history(ticker, years=years, data_dir=data_dir)
     if prices.empty:
@@ -175,7 +184,17 @@ def build_historical_pb_series(
     """
     cache = Path(data_dir) / f"{ticker}_pb_series.csv"
     if cache.exists():
-        return pd.read_csv(cache, index_col=0, parse_dates=True).squeeze()
+        try:
+            df = pd.read_csv(cache, index_col=0, parse_dates=True)
+            if df.empty:
+                cache.unlink(missing_ok=True)
+            else:
+                s = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna()
+                if not s.empty:
+                    return s
+                cache.unlink(missing_ok=True)
+        except Exception:
+            cache.unlink(missing_ok=True)
 
     info = fetch_info(ticker, data_dir)
     bvps = info.get("bookValue")

@@ -314,8 +314,11 @@ def page_dashboard(config: dict) -> None:
                 return style
         return ""
 
-    styled = df_display.style.applymap(color_signal, subset=["訊號"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    if "訊號" in df_display.columns:
+        styled = df_display.style.map(color_signal, subset=["訊號"])
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(df_display, use_container_width=True, hide_index=True)
 
     # --- Per-ticker details ---
     st.subheader("個股詳情 & P/E Band 走勢圖")
@@ -403,8 +406,11 @@ def page_history(config: dict) -> None:
                 return style
         return ""
 
-    styled = df.style.applymap(color_row, subset=["signal_display"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    if "signal_display" in df.columns:
+        styled = df.style.map(color_row, subset=["signal_display"])
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
     csv = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button(
