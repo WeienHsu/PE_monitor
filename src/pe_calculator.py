@@ -8,6 +8,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+def _to_tz_naive(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """Strip timezone info from a DatetimeIndex regardless of whether it is tz-aware."""
+    if idx.tz is not None:
+        return idx.tz_convert("UTC").tz_localize(None)
+    return idx
+
+
 from src.data_fetcher import (
     fetch_info,
     fetch_price_history,
@@ -131,16 +138,28 @@ def build_historical_pe_series(
     else:
         price_series = prices["Close"].dropna()
 
+    # Ensure float dtype and tz-naive DatetimeIndex for safe comparison
+    price_series = price_series.astype(float)
+    price_series.index = _to_tz_naive(pd.to_datetime(price_series.index))
+    quarterly_eps = quarterly_eps.copy()
+    quarterly_eps.index = _to_tz_naive(pd.to_datetime(quarterly_eps.index))
+
     # For each trading day, compute TTM EPS = sum of 4 most recent quarters
     pe_series = {}
     for dt in price_series.index:
         past_quarters = quarterly_eps[quarterly_eps.index <= dt].sort_index(ascending=False)
         if len(past_quarters) < 4:
             continue
-        ttm_eps = past_quarters.iloc[:4].sum()
+        ttm_eps = float(past_quarters.iloc[:4].sum())
         if ttm_eps <= 0:
             continue
-        pe_series[dt] = price_series[dt] / ttm_eps
+        try:
+            price_val = price_series.loc[dt]
+            if isinstance(price_val, pd.Series):
+                price_val = price_val.iloc[0]
+            pe_series[dt] = float(price_val) / ttm_eps
+        except Exception:
+            continue
 
     result = pd.Series(pe_series, name="PE")
     result.index = pd.to_datetime(result.index)
@@ -183,7 +202,9 @@ def build_historical_pb_series(
     else:
         price_series = prices["Close"].dropna()
 
-    pb_series = (price_series / bvps).rename("PB")
+    price_series = price_series.astype(float)
+    price_series.index = _to_tz_naive(pd.to_datetime(price_series.index))
+    pb_series = (price_series / float(bvps)).rename("PB")
     pb_series.to_csv(cache, header=True)
     return pb_series
 
