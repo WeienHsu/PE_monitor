@@ -56,6 +56,13 @@ def _sentiment_badge(sentiment: dict | None) -> str:
     return {"positive": "📰🟢 正面", "neutral": "📰⚪ 中性", "negative": "📰🔴 負面"}.get(label, "📰 N/A")
 
 
+def _strategy_d_badge(signal) -> str:
+    """Return badge for Strategy D signal. None = feature disabled."""
+    if signal is None:
+        return ""
+    return "📐 收斂中" if signal else "—"
+
+
 @st.cache_data(ttl=300)
 def cached_scan_all(watchlist_key: str) -> list[dict]:
     """Cache scan results for 5 minutes (key changes when watchlist changes)."""
@@ -63,7 +70,7 @@ def cached_scan_all(watchlist_key: str) -> list[dict]:
     return scan_all(config)
 
 
-def pe_band_chart(ticker: str, config: dict) -> go.Figure | None:
+def pe_band_chart(ticker: str, config: dict, strategy_d_dates: list | None = None) -> go.Figure | None:
     """
     Dual-axis chart:
       Left  Y-axis  — P/E (or P/B) line + percentile colour bands
@@ -165,6 +172,32 @@ def pe_band_chart(ticker: str, config: dict) -> go.Figure | None:
                 hovertemplate="%{x|%Y-%m-%d}<br>股價: $%{y:.2f}<extra></extra>",
             )
         )
+
+    # Strategy D signal markers on price curve (right axis)
+    if strategy_d_dates and price_series is not None and not price_series.empty:
+        sig_idx = _to_tz_naive(pd.to_datetime(strategy_d_dates, errors="coerce").dropna())
+        sig_idx = sig_idx[
+            (sig_idx >= price_series.index.min()) &
+            (sig_idx <= price_series.index.max())
+        ]
+        if len(sig_idx) > 0:
+            sig_prices = price_series.reindex(sig_idx, method="nearest")
+            fig.add_trace(
+                go.Scatter(
+                    x=sig_prices.index,
+                    y=sig_prices.values,
+                    mode="markers",
+                    name="Strategy D",
+                    yaxis="y2",
+                    marker=dict(
+                        symbol="triangle-up",
+                        size=12,
+                        color="#9b59b6",
+                        line=dict(color="white", width=1),
+                    ),
+                    hovertemplate="%{x|%Y-%m-%d}<br>Strategy D 訊號<extra></extra>",
+                )
+            )
 
     fig.update_layout(
         title=f"{ticker} — 歷史 {metric_name} Band + 股價（{years} 年）",
@@ -363,6 +396,7 @@ def page_dashboard(config: dict) -> None:
                 "訊號": r.get("signal_display", "N/A"),
                 "新聞情緒": _sentiment_badge(r.get("news_sentiment")),
                 "綜合訊號": r.get("composite_display", r.get("signal_display", "N/A")),
+                "技術訊號": _strategy_d_badge(r.get("strategy_d_signal")),
                 "持倉損益%": r.get("holding_pnl_pct"),
                 "⚠️": "EPS 過期" if r.get("eps_stale") else ("" if not r.get("error") else r["error"]),
             }
@@ -389,6 +423,11 @@ def page_dashboard(config: dict) -> None:
     signal_cols = [c for c in ["訊號", "綜合訊號"] if c in df_display.columns]
     if signal_cols:
         styled = df_display.style.map(color_signal, subset=signal_cols)
+        if "技術訊號" in df_display.columns:
+            styled = styled.map(
+                lambda v: "background-color: #e8d5f5" if "收斂中" in str(v) else "",
+                subset=["技術訊號"],
+            )
         st.dataframe(styled, use_container_width=True, hide_index=True)
     else:
         st.dataframe(df_display, use_container_width=True, hide_index=True)
@@ -416,6 +455,17 @@ def page_dashboard(config: dict) -> None:
             cn1.metric("PE 訊號", r.get("signal_display", "N/A"))
             cn2.metric("新聞情緒", _sentiment_badge(r.get("news_sentiment")))
             cn3.metric("綜合訊號", r.get("composite_display", r.get("signal_display", "N/A")))
+
+            # Strategy D technical signal row
+            sd_signal = r.get("strategy_d_signal")
+            if sd_signal is not None:
+                sd_val = "📐 收斂訊號（Strategy D）" if sd_signal else "— 無訊號"
+                sd1, sd2 = st.columns(2)
+                sd1.metric("技術動能訊號", sd_val)
+                if sd_signal:
+                    sd2.caption("KD 低檔金叉 + MACD 柱狀圖收斂，動能翻轉前兆")
+                if r.get("strategy_d_error"):
+                    st.caption(f"⚠️ 技術訊號計算錯誤：{r['strategy_d_error']}")
 
             if r.get("eps_stale"):
                 st.warning(f"⚠️ EPS 資料可能過期（最後報告：{r.get('last_report_date', '未知')}）")
@@ -494,7 +544,7 @@ def page_dashboard(config: dict) -> None:
                     st.caption("📰 近期無相關新聞")
 
             # Chart
-            fig = pe_band_chart(ticker, config)
+            fig = pe_band_chart(ticker, config, strategy_d_dates=r.get("strategy_d_dates", []))
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
             else:
@@ -592,6 +642,21 @@ def main() -> None:
                 st.sidebar.info("新聞情緒：📰 部分股票無近期新聞")
             else:
                 st.sidebar.success("新聞情緒：✅ Finnhub 正常運作")
+
+    # Strategy D toggle (always visible, gated by pandas-ta availability)
+    st.sidebar.markdown("---")
+    sd_settings = config["settings"].get("strategy_d", {})
+    sd_currently_enabled = sd_settings.get("enabled", False)
+    sd_toggled = st.sidebar.toggle(
+        "Strategy D 技術訊號",
+        value=sd_currently_enabled,
+        help="啟用 KD+MACD 收斂訊號（需安裝 pandas-ta）",
+    )
+    if sd_toggled != sd_currently_enabled:
+        config["settings"].setdefault("strategy_d", {})["enabled"] = sd_toggled
+        save_config(config)
+        st.cache_data.clear()
+        st.rerun()
 
     if page == "自選股管理":
         page_watchlist_management(config)

@@ -87,14 +87,34 @@ def init_config_from_env() -> dict:
     return config
 
 
+_SETTINGS_DEFAULTS = {
+    "strategy_d": {
+        "enabled": False,
+        "kd_window": 10,
+        "n_bars": 3,
+        "recovery_pct": 0.7,
+    }
+}
+
+
 def load_config() -> dict:
-    """Load config.json; create from .env if it doesn't exist."""
+    """Load config.json; create from .env if it doesn't exist.
+
+    Merges any missing settings keys with defaults so new features are
+    available even when the user's config.json pre-dates them.
+    """
     if not CONFIG_PATH.exists():
         config = init_config_from_env()
         save_config(config)
         return config
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        config = json.load(f)
+    # Merge in any missing default settings (non-destructive)
+    settings = config.setdefault("settings", {})
+    for key, default in _SETTINGS_DEFAULTS.items():
+        if key not in settings:
+            settings[key] = default
+    return config
 
 
 def save_config(config: dict) -> None:
