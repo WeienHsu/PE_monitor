@@ -93,6 +93,7 @@ _SETTINGS_DEFAULTS = {
         "kd_window": 10,
         "n_bars": 3,
         "recovery_pct": 0.7,
+        "kd_k_threshold": 20,
     }
 }
 
