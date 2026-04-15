@@ -20,7 +20,9 @@ from src.pe_calculator import (
     build_historical_pb_series,
     build_historical_pe_series,
     get_percentiles,
+    _to_tz_naive,
 )
+from src.data_fetcher import fetch_price_history
 from src.report_generator import list_report_dates, load_report, scan_all, scan_ticker
 from src.stock_analyzer import TYPE_LABEL, analyze_suitability
 from src.utils import (
@@ -53,7 +55,11 @@ def cached_scan_all(watchlist_key: str) -> list[dict]:
 
 
 def pe_band_chart(ticker: str, config: dict) -> go.Figure | None:
-    """Return a Plotly figure showing historical P/E (or P/B) with percentile bands."""
+    """
+    Dual-axis chart:
+      Left  Y-axis  — P/E (or P/B) line + percentile colour bands
+      Right Y-axis  — Stock closing price line
+    """
     settings = config["settings"]
     data_dir = settings["data_dir"]
     years = settings.get("pe_history_years", 5)
@@ -75,29 +81,44 @@ def pe_band_chart(ticker: str, config: dict) -> go.Figure | None:
     if not pcts:
         return None
 
+    # --- Stock price series (right axis) ---
+    price_df = fetch_price_history(ticker, years=years, data_dir=data_dir)
+    price_series = None
+    if not price_df.empty and "Close" in price_df.columns:
+        price_series = pd.to_numeric(price_df["Close"], errors="coerce").dropna()
+        price_series.index = _to_tz_naive(pd.to_datetime(price_series.index))
+        # Align to the PE series date range
+        if not series.index.empty:
+            price_series = price_series[price_series.index >= series.index.min()]
+
+    # --- Build figure with secondary y-axis ---
     fig = go.Figure()
 
-    # Band fills
-    band_colors = [
-        (10, 25, "rgba(0,200,100,0.10)"),
-        (25, 50, "rgba(100,180,255,0.10)"),
-        (50, 75, "rgba(255,220,0,0.10)"),
-        (75, 90, "rgba(255,80,80,0.10)"),
+    # Percentile colour bands (left axis)
+    band_defs = [
+        (10, 25, "rgba(0,200,100,0.12)",   "BUY 區間"),
+        (25, 50, "rgba(100,180,255,0.10)",  "WATCH 區間"),
+        (50, 75, "rgba(255,220,0,0.10)",    "CAUTION 區間"),
+        (75, 90, "rgba(255,80,80,0.12)",    "SELL 區間"),
     ]
-    for lo, hi, color in band_colors:
+    for lo, hi, color, label in band_defs:
         if lo in pcts and hi in pcts:
             fig.add_hrect(
                 y0=pcts[lo], y1=pcts[hi],
                 fillcolor=color, line_width=0,
+                annotation_text=label,
+                annotation_position="left",
+                annotation_font_size=10,
+                annotation_font_color="gray",
             )
 
-    # Percentile lines
+    # Percentile horizontal lines (left axis)
     line_styles = {
-        10: ("dash", "gray"),
-        25: ("dot", "green"),
-        50: ("solid", "blue"),
-        75: ("dot", "red"),
-        90: ("dash", "gray"),
+        10: ("dash",  "#999"),
+        25: ("dot",   "#27ae60"),
+        50: ("solid", "#2980b9"),
+        75: ("dot",   "#e74c3c"),
+        90: ("dash",  "#999"),
     }
     for p, (dash, color) in line_styles.items():
         if p in pcts:
@@ -105,26 +126,66 @@ def pe_band_chart(ticker: str, config: dict) -> go.Figure | None:
                 y=pcts[p], line_dash=dash, line_color=color,
                 annotation_text=f"P{p}: {pcts[p]:.1f}",
                 annotation_position="right",
+                annotation_font_size=10,
             )
 
-    # Main series
+    # P/E curve (left axis, yaxis="y")
     fig.add_trace(
         go.Scatter(
             x=series.index,
             y=series.values,
             mode="lines",
             name=metric_name,
-            line=dict(color="steelblue", width=1.5),
+            yaxis="y",
+            line=dict(color="#2c7bb6", width=2),
+            hovertemplate=f"%{{x|%Y-%m-%d}}<br>{metric_name}: %{{y:.1f}}<extra></extra>",
         )
     )
 
+    # Stock price curve (right axis, yaxis="y2")
+    if price_series is not None and not price_series.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=price_series.index,
+                y=price_series.values,
+                mode="lines",
+                name="股價 (USD)",
+                yaxis="y2",
+                line=dict(color="#e67e22", width=1.5, dash="dot"),
+                opacity=0.75,
+                hovertemplate="%{x|%Y-%m-%d}<br>股價: $%{y:.2f}<extra></extra>",
+            )
+        )
+
     fig.update_layout(
-        title=f"{ticker} — 歷史 {metric_name} Band（{years} 年）",
-        xaxis_title="日期",
-        yaxis_title=metric_name,
-        height=400,
-        margin=dict(l=50, r=80, t=50, b=30),
-        showlegend=False,
+        title=f"{ticker} — 歷史 {metric_name} Band + 股價（{years} 年）",
+        xaxis=dict(title="日期", showgrid=False),
+        yaxis=dict(
+            title=metric_name,
+            titlefont=dict(color="#2c7bb6"),
+            tickfont=dict(color="#2c7bb6"),
+            showgrid=True,
+            gridcolor="rgba(0,0,0,0.06)",
+        ),
+        yaxis2=dict(
+            title="股價 (USD)",
+            titlefont=dict(color="#e67e22"),
+            tickfont=dict(color="#e67e22"),
+            overlaying="y",
+            side="right",
+            showgrid=False,
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+        ),
+        height=450,
+        margin=dict(l=60, r=80, t=60, b=40),
+        hovermode="x unified",
+        plot_bgcolor="white",
     )
     return fig
 
