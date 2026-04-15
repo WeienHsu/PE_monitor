@@ -19,6 +19,9 @@ from src.pe_calculator import (
     get_pb_ratio,
     get_percentiles,
 )
+from src.composite_signal import compute_composite
+from src.news_fetcher import fetch_news
+from src.sentiment_analyzer import analyze_sentiment, score_articles_individually
 from src.utils import days_since, get_holding, load_config
 
 
@@ -56,56 +59,91 @@ def scan_ticker(ticker: str, config: dict) -> dict:
     }
 
     # 1. Latest price
+    skip_metric = False
+    history = None
     price = get_latest_close(ticker, data_dir)
     if price is None:
         result["error"] = "無法取得股價"
-        return result
-    result["price"] = round(price, 2)
+        skip_metric = True
+    else:
+        result["price"] = round(price, 2)
 
     # 2. Compute metric
-    if recommended_metric == "PB":
-        pb = get_pb_ratio(ticker, price, data_dir)
-        if pb is None:
-            result["error"] = "無法取得 P/B 資料"
-            return result
-        result["metric_value"] = round(pb, 2)
-        history = build_historical_pb_series(ticker, years=years, data_dir=data_dir)
-    else:
-        ttm_eps, report_date = calc_ttm_eps(ticker, data_dir)
-
-        # If EPS is negative → fallback to P/B
-        if ttm_eps is not None and ttm_eps <= 0:
-            result["metric_label"] = "PB (EPS 負值)"
-            result["recommended_metric"] = "PB"
+    if not skip_metric:
+        if recommended_metric == "PB":
             pb = get_pb_ratio(ticker, price, data_dir)
-            if pb:
+            if pb is None:
+                result["error"] = "無法取得 P/B 資料"
+                skip_metric = True
+            else:
                 result["metric_value"] = round(pb, 2)
                 history = build_historical_pb_series(ticker, years=years, data_dir=data_dir)
-                result["ttm_eps"] = round(ttm_eps, 4)
-                result["last_report_date"] = report_date
-            else:
-                result["error"] = "EPS 為負，且無法取得 P/B"
-                return result
-        elif ttm_eps is None:
-            result["error"] = "無法計算 TTM EPS"
-            return result
         else:
-            pe = price / ttm_eps
-            result["ttm_eps"] = round(ttm_eps, 4)
-            result["metric_value"] = round(pe, 2)
-            result["last_report_date"] = report_date
-            if report_date and days_since(report_date) > 100:
-                result["eps_stale"] = True
-            history = build_historical_pe_series(ticker, years=years, data_dir=data_dir)
+            ttm_eps, report_date = calc_ttm_eps(ticker, data_dir)
+
+            # If EPS is negative → fallback to P/B
+            if ttm_eps is not None and ttm_eps <= 0:
+                result["metric_label"] = "PB (EPS 負值)"
+                result["recommended_metric"] = "PB"
+                pb = get_pb_ratio(ticker, price, data_dir)
+                if pb:
+                    result["metric_value"] = round(pb, 2)
+                    history = build_historical_pb_series(ticker, years=years, data_dir=data_dir)
+                    result["ttm_eps"] = round(ttm_eps, 4)
+                    result["last_report_date"] = report_date
+                else:
+                    result["error"] = "EPS 為負，且無法取得 P/B"
+                    skip_metric = True
+            elif ttm_eps is None:
+                result["error"] = "無法計算 TTM EPS"
+                skip_metric = True
+            else:
+                pe = price / ttm_eps
+                result["ttm_eps"] = round(ttm_eps, 4)
+                result["metric_value"] = round(pe, 2)
+                result["last_report_date"] = report_date
+                if report_date and days_since(report_date) > 100:
+                    result["eps_stale"] = True
+                history = build_historical_pe_series(ticker, years=years, data_dir=data_dir)
 
     # 3. Percentiles & signal
-    if history is not None and not history.empty:
+    if not skip_metric and history is not None and not history.empty:
         result["percentiles"] = get_percentiles(history)
         rank = current_percentile_rank(result["metric_value"], history)
         result["percentile_rank"] = round(rank, 1)
         signal = classify_signal(rank, entry=entry_pct, exit_=exit_pct)
         result["signal"] = signal
         result["signal_display"] = f"{SIGNAL_EMOJI[signal]} {SIGNAL_LABEL[signal]}"
+
+    # 4. News sentiment & composite signal (always runs, even for ETFs without P/E data)
+    try:
+        lookback_days = int(settings.get("news_days_lookback", 7))
+        articles, news_source, news_status = fetch_news(ticker, config, data_dir)
+        sentiment = analyze_sentiment(articles, lookback_days=lookback_days)
+        scored_articles = score_articles_individually(articles, lookback_days=lookback_days)
+        result["news_sentiment"] = sentiment
+        result["news_articles"] = scored_articles[:3]
+        result["news_source"] = news_source
+        result["news_status"] = news_status
+        # Composite signal
+        if sentiment.get("available") and result["signal"] not in ("N/A", None):
+            composite_key, composite_display = compute_composite(
+                result["signal"], sentiment["label"]
+            )
+        else:
+            composite_key = result["signal"]
+            composite_display = result["signal_display"]
+        result["composite_signal"] = composite_key
+        result["composite_display"] = composite_display
+    except Exception:
+        result["news_sentiment"] = {"available": False, "score": 0.0, "label": "neutral",
+                                    "count": 0, "article_count_by_label": {}, "latest_headline": "",
+                                    "latest_date": ""}
+        result["news_articles"] = []
+        result["news_source"] = "none"
+        result["news_status"] = "failed"
+        result["composite_signal"] = result["signal"]
+        result["composite_display"] = result["signal_display"]
 
     return result
 
@@ -158,6 +196,11 @@ def save_daily_report(results: list[dict], report_dir: str = "reports") -> str:
                 "holding_pnl_pct": r.get("holding_pnl_pct"),
                 "error": r.get("error"),
                 "last_report_date": r.get("last_report_date"),
+                "news_status": r.get("news_status", ""),
+                "news_source": r.get("news_source", ""),
+                "news_label": (r.get("news_sentiment") or {}).get("label", ""),
+                "composite_signal": r.get("composite_signal", r.get("signal", "")),
+                "composite_display": r.get("composite_display", r.get("signal_display", "")),
             }
         )
     df = pd.DataFrame(rows)
