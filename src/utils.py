@@ -68,6 +68,7 @@ def init_config_from_env() -> dict:
     pe_history_years = int(os.getenv("PE_HISTORY_YEARS", "5"))
     entry_percentile = int(os.getenv("ENTRY_PERCENTILE", "25"))
     exit_percentile = int(os.getenv("EXIT_PERCENTILE", "75"))
+    finnhub_api_key = os.getenv("FINNHUB_API_KEY", "")
 
     config = {
         "watchlist": _parse_watchlist(watchlist_raw),
@@ -78,6 +79,9 @@ def init_config_from_env() -> dict:
             "exit_percentile": exit_percentile,
             "data_dir": "data",
             "report_dir": "reports",
+            "finnhub_api_key": finnhub_api_key,
+            "news_days_lookback": 7,
+            "news_weight": 0.3,
         },
     }
     return config

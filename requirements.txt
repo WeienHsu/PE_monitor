@@ -4,3 +4,6 @@ plotly>=5.20.0
 pandas>=2.0.0
 numpy>=1.26.0
 python-dotenv>=1.0.0
+finnhub-python>=2.4.19
+nltk>=3.8.1
+feedparser>=6.0.0

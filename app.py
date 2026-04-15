@@ -23,6 +23,7 @@ from src.pe_calculator import (
     _to_tz_naive,
 )
 from src.data_fetcher import fetch_price_history
+from src.composite_signal import composite_color
 from src.report_generator import list_report_dates, load_report, scan_all, scan_ticker
 from src.stock_analyzer import TYPE_LABEL, analyze_suitability
 from src.utils import (
@@ -46,6 +47,14 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _sentiment_badge(sentiment: dict | None) -> str:
+    """Return a compact emoji + text badge for a news_sentiment dict."""
+    if not sentiment or not sentiment.get("available"):
+        return "📰 N/A"
+    label = sentiment.get("label", "neutral")
+    return {"positive": "📰🟢 正面", "neutral": "📰⚪ 中性", "negative": "📰🔴 負面"}.get(label, "📰 N/A")
+
 
 @st.cache_data(ttl=300)
 def cached_scan_all(watchlist_key: str) -> list[dict]:
@@ -352,6 +361,8 @@ def page_dashboard(config: dict) -> None:
                 metric_label: r.get("metric_value"),
                 "歷史百分位": r.get("percentile_rank"),
                 "訊號": r.get("signal_display", "N/A"),
+                "新聞情緒": _sentiment_badge(r.get("news_sentiment")),
+                "綜合訊號": r.get("composite_display", r.get("signal_display", "N/A")),
                 "持倉損益%": r.get("holding_pnl_pct"),
                 "⚠️": "EPS 過期" if r.get("eps_stale") else ("" if not r.get("error") else r["error"]),
             }
@@ -362,19 +373,22 @@ def page_dashboard(config: dict) -> None:
     # Colour signal column
     def color_signal(val: str) -> str:
         mapping = {
+            "🌟": "background-color: #a8e6a3",
             "🟢": "background-color: #d4edda",
             "🔵": "background-color: #cce5ff",
             "⚪": "",
             "🟡": "background-color: #fff3cd",
             "🔴": "background-color: #f8d7da",
+            "🚨": "background-color: #f5a0a8",
         }
         for emoji, style in mapping.items():
             if emoji in str(val):
                 return style
         return ""
 
-    if "訊號" in df_display.columns:
-        styled = df_display.style.map(color_signal, subset=["訊號"])
+    signal_cols = [c for c in ["訊號", "綜合訊號"] if c in df_display.columns]
+    if signal_cols:
+        styled = df_display.style.map(color_signal, subset=signal_cols)
         st.dataframe(styled, use_container_width=True, hide_index=True)
     else:
         st.dataframe(df_display, use_container_width=True, hide_index=True)
@@ -396,6 +410,12 @@ def page_dashboard(config: dict) -> None:
             metric_label = r.get("metric_label") or r.get("recommended_metric", "PE")
             c3.metric(metric_label, f"{r['metric_value']:.2f}" if r.get("metric_value") is not None else "N/A")
             c4.metric("歷史百分位", f"{r['percentile_rank']:.1f}%" if r.get("percentile_rank") is not None else "N/A")
+
+            # Composite signal row
+            cn1, cn2, cn3 = st.columns(3)
+            cn1.metric("PE 訊號", r.get("signal_display", "N/A"))
+            cn2.metric("新聞情緒", _sentiment_badge(r.get("news_sentiment")))
+            cn3.metric("綜合訊號", r.get("composite_display", r.get("signal_display", "N/A")))
 
             if r.get("eps_stale"):
                 st.warning(f"⚠️ EPS 資料可能過期（最後報告：{r.get('last_report_date', '未知')}）")
@@ -419,6 +439,59 @@ def page_dashboard(config: dict) -> None:
                 p_cols = st.columns(5)
                 for i, p in enumerate([10, 25, 50, 75, 90]):
                     p_cols[i].metric(f"P{p}", f"{pcts.get(p, 0):.1f}")
+
+            # News sentiment section
+            sentiment = r.get("news_sentiment")
+            news_status = r.get("news_status", "none")
+            news_source = r.get("news_source", "none")
+
+            st.markdown("**📰 最新新聞與情緒**")
+            # Source / status caption
+            source_msgs = {
+                "rss_fallback": "📡 資料來源：Yahoo Finance RSS（備用）",
+                "rate_limited": "📡 Finnhub 達速率上限，使用 RSS 備用資料",
+                "invalid_key":  "❌ Finnhub API Key 無效，使用 RSS 備用資料",
+                "failed":       None,
+            }
+            src_msg = source_msgs.get(news_status) or (
+                source_msgs.get(news_source) if news_source != "finnhub" else None
+            )
+            if src_msg:
+                st.caption(src_msg)
+
+            if news_status == "failed" and news_source == "none":
+                st.warning("⚠️ 無法取得新聞，綜合訊號僅依 PE 計算")
+            elif sentiment and sentiment.get("available"):
+                articles_display = r.get("news_articles", [])
+                if articles_display:
+                    for art in articles_display:
+                        art_label = art.get("sentiment_label", "neutral")
+                        badge = {"positive": "🟢", "neutral": "⚪", "negative": "🔴"}.get(art_label, "⚪")
+                        pub_date = art.get("date_str", "")
+                        source_name = art.get("source", "")
+                        url = art.get("url", "")
+                        headline = art.get("headline", "")
+                        meta = f"{source_name} · {pub_date}" if source_name else pub_date
+                        if url:
+                            st.markdown(
+                                f"{badge} [{headline}]({url})  "
+                                f"<small style='color:gray'>{meta}</small>",
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.markdown(
+                                f"{badge} {headline}  "
+                                f"<small style='color:gray'>{meta}</small>",
+                                unsafe_allow_html=True,
+                            )
+                else:
+                    st.caption("📰 近期無相關新聞")
+            else:
+                api_key = config.get("settings", {}).get("finnhub_api_key", "").strip()
+                if not api_key:
+                    st.caption("💡 在 config.json 設定 `finnhub_api_key` 可啟用精準新聞情緒分析")
+                else:
+                    st.caption("📰 近期無相關新聞")
 
             # Chart
             fig = pe_band_chart(ticker, config)
@@ -500,6 +573,25 @@ def main() -> None:
         f"自選股：{len(config.get('watchlist', []))} 檔  \n"
         f"持倉：{len(config.get('holdings', []))} 檔"
     )
+
+    # News status indicator (shown after a scan has run)
+    watchlist_key = ",".join(sorted(e["ticker"] for e in config.get("watchlist", [])))
+    if watchlist_key and page == "每日監測儀表板":
+        cached_results = cached_scan_all(watchlist_key) if config.get("watchlist") else []
+        if cached_results:
+            statuses = {r.get("news_status", "none") for r in cached_results}
+            if "invalid_key" in statuses:
+                st.sidebar.error("新聞情緒：🔴 Finnhub API Key 無效")
+            elif "rate_limited" in statuses:
+                st.sidebar.warning("新聞情緒：⚠️ Finnhub 達速率上限，已切換 RSS")
+            elif "rss_fallback" in statuses:
+                st.sidebar.warning("新聞情緒：⚠️ 使用 RSS 備用（建議設定 Finnhub Key）")
+            elif "failed" in statuses or "none" in statuses:
+                st.sidebar.error("新聞情緒：🔴 無法取得新聞資料")
+            elif "no_articles" in statuses:
+                st.sidebar.info("新聞情緒：📰 部分股票無近期新聞")
+            else:
+                st.sidebar.success("新聞情緒：✅ Finnhub 正常運作")
 
     if page == "自選股管理":
         page_watchlist_management(config)
