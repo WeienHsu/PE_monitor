@@ -156,6 +156,7 @@ def ensure_watchlist_analyzed(config: dict) -> bool:
             result = analyze_suitability(entry["ticker"], data_dir)
             entry["name"] = result.get("name") or entry.get("name", "")
             entry["type"] = result.get("type", "unknown")
+            entry["type_source"] = "auto"
             entry["recommended_metric"] = result.get("recommended_metric", "PE")
             entry["suitability_score"] = result.get("suitability_score", 0)
             entry["reason"] = result.get("reason", "")

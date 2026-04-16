@@ -13,22 +13,50 @@ CONFIG_PATH = Path("config.json")
 
 
 def _parse_watchlist(raw: str) -> list[dict]:
-    """Parse WATCHLIST env value into minimal watchlist entries."""
+    """Parse WATCHLIST env value into minimal watchlist entries.
+
+    Supports both plain 'AAPL' and typed 'AAPL:growth' formats.
+    Valid types: stable / growth / cyclical / etf
+    Any unrecognised or missing type defaults to 'unknown' (auto-analysed).
+
+    Examples
+    --------
+    WATCHLIST=AAPL:growth,GOOGL,MSFT:stable,XOM:cyclical
+    """
+    VALID_TYPES = {"stable", "growth", "cyclical", "etf"}
     entries = []
-    for ticker in raw.split(","):
-        ticker = ticker.strip().upper()
-        if ticker:
-            entries.append(
-                {
-                    "ticker": ticker,
-                    "name": "",
-                    "type": "unknown",
-                    "recommended_metric": "PE",
-                    "suitability_score": 0,
-                    "reason": "尚未分析",
-                    "added_date": date.today().isoformat(),
-                }
-            )
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split(":", 1)
+        ticker = parts[0].strip().upper()
+        if not ticker:
+            continue
+
+        if len(parts) == 2 and parts[1].strip().lower() in VALID_TYPES:
+            predefined_type = parts[1].strip().lower()
+            type_source = "env"
+            recommended_metric = "PB" if predefined_type == "cyclical" else "PE"
+            reason = f"類型由 .env 預設為 {predefined_type}"
+        else:
+            predefined_type = "unknown"
+            type_source = "auto"
+            recommended_metric = "PE"
+            reason = "尚未分析"
+
+        entries.append(
+            {
+                "ticker": ticker,
+                "name": "",
+                "type": predefined_type,
+                "type_source": type_source,
+                "recommended_metric": recommended_metric,
+                "suitability_score": 0,
+                "reason": reason,
+                "added_date": date.today().isoformat(),
+            }
+        )
     return entries
 
 
@@ -117,6 +145,10 @@ def load_config() -> dict:
     for key, default in _SETTINGS_DEFAULTS.items():
         if key not in settings:
             settings[key] = default
+    # Backfill type_source for watchlist entries that predate this field
+    for entry in config.get("watchlist", []):
+        if "type_source" not in entry:
+            entry["type_source"] = "auto"
     return config
 
 

@@ -127,6 +127,19 @@ def get_forward_pe(ticker: str, data_dir: str = "data") -> float | None:
     return round(float(fpe), 2)
 
 
+def get_ev_ebitda(ticker: str, data_dir: str = "data") -> float | None:
+    """
+    Return EV/EBITDA from yfinance .info["enterpriseToEbitda"].
+    Returns None if unavailable or non-positive.
+    Used primarily for cyclical stock composite signal.
+    """
+    cf_data = fetch_cashflow(ticker, data_dir)
+    ev_ebitda = cf_data.get("ev_ebitda")
+    if ev_ebitda is None or ev_ebitda <= 0:
+        return None
+    return round(float(ev_ebitda), 2)
+
+
 # ---------------------------------------------------------------------------
 # Historical PE/PB bands
 # ---------------------------------------------------------------------------
