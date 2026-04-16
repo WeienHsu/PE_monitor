@@ -237,6 +237,43 @@ def pe_band_chart(ticker: str, config: dict, strategy_d_dates: list | None = Non
 def page_watchlist_management(config: dict) -> None:
     st.header("自選股管理")
 
+    # --- Type selection guide ---
+    with st.expander("📖 股票類型選擇指引（點擊展開）", expanded=False):
+        st.markdown("""
+### 快速決策表
+
+| 條件 | 建議類型 | 主要因子 | 調整上限 |
+|------|----------|---------|---------|
+| EPS 穩定成長，波動 < 30% | **穩定型** (stable) | P/CF（權重×2）+ PEG + Forward P/E | ±2 格 |
+| EPS 快速成長，波動 30–60% | **成長型** (growth) | PEG（×2）+ Forward P/E（×2） | ±2 格 |
+| EPS 時正時負，與景氣強相關 | **景氣循環型** (cyclical) | EV/EBITDA + P/CF | ±1 格 |
+| 追蹤指數或一籃子股票 | **ETF** (etf) | Forward P/E | ±1 格 |
+
+### 各類型使用說明
+
+**🟢 穩定型 (stable)** — 大型消費、公用事業、金融（如 MSFT、JNJ、V）
+- P/CF 在此類型權重 ×2，因現金流比帳面盈餘更難造假
+- 所有補充因子均啟用，允許最大 ±2 格訊號調整
+
+**🟡 成長型 (growth)** — 科技、生技、高成長平台（如 GOOGL、NVDA、META）
+- P/CF **不參與**計算（成長股大量再投資壓低 OCF，此數字失真）
+- PEG 和 Forward P/E 各自權重 ×2，是最重要的判斷依據
+- 允許最大 ±2 格訊號調整
+
+**🔴 景氣循環型 (cyclical)** — 能源、鋼鐵、航運、半導體設備（如 XOM、CLF）
+- PEG / Forward P/E **不參與**（景氣谷底時這些數字最危險）
+- 改用 EV/EBITDA（< 8 低估，> 15 高估）作為主要補充因子
+- 保守設計，僅允許 ±1 格訊號調整
+
+**📦 ETF (etf)** — 指數基金、行業 ETF（如 SPY、QQQ）
+- 僅 Forward P/E 有意義（反映市場整體共識估值）
+- 僅允許 ±1 格訊號調整
+
+---
+**💡 手動覆蓋時機：** 自動分類依 EPS 波動率判斷，但產業邏輯更重要。
+手動設定後不會被自動重新分析覆蓋（會標記為「✏️ 手動」來源）。
+        """)
+
     # --- Add new stock ---
     st.subheader("新增股票")
     col1, col2 = st.columns([3, 1])
@@ -316,15 +353,93 @@ def page_watchlist_management(config: dict) -> None:
         ):
             col_a, col_b = st.columns([3, 1])
             with col_a:
-                st.write(f"建議指標：**{entry.get('recommended_metric', 'PE')}**")
+                # Static info
+                type_source = entry.get("type_source", "auto")
+                src_label = {"auto": "🤖 自動", "env": "⚙️ .env 預設", "manual": "✏️ 手動"}.get(type_source, "🤖 自動")
+                st.caption(f"類型來源：{src_label}  ｜  加入日期：{entry.get('added_date', '—')}")
                 st.write(f"分析說明：{entry.get('reason', '—')}")
-                st.write(f"加入日期：{entry.get('added_date', '—')}")
 
                 if holding:
                     st.markdown(
                         f"持倉：{holding['shares']} 股 @ ${holding['cost']:.2f}  "
                         f"（買入：{holding.get('buy_date', '—')}）"
                     )
+
+                # Type & metric edit form
+                TYPE_OPTIONS = ["stable", "growth", "cyclical", "etf", "unknown"]
+                TYPE_NAMES = {
+                    "stable": "穩定型 ✅", "growth": "成長型 🟡",
+                    "cyclical": "景氣循環型 ❌", "etf": "ETF 📦", "unknown": "未知 ❓",
+                }
+                TYPE_HELP = (
+                    "stable：P/CF 主導，允許 ±2 格調整\n"
+                    "growth：PEG + Forward P/E 主導，P/CF 不參與，允許 ±2 格調整\n"
+                    "cyclical：EV/EBITDA 主導，PEG/FPE 停用，允許 ±1 格調整\n"
+                    "etf：僅 Forward P/E，允許 ±1 格調整\n"
+                    "unknown：等同原始行為（全因子等權重，±1 格）"
+                )
+                with st.form(f"type_form_{ticker}"):
+                    st.markdown("**調整類型與指標**")
+                    current_type = entry.get("type", "unknown")
+                    new_type = st.selectbox(
+                        "股票類型",
+                        options=TYPE_OPTIONS,
+                        format_func=lambda t: TYPE_NAMES.get(t, t),
+                        index=TYPE_OPTIONS.index(current_type) if current_type in TYPE_OPTIONS else 4,
+                        help=TYPE_HELP,
+                        key=f"type_sel_{ticker}",
+                    )
+                    current_metric = entry.get("recommended_metric", "PE")
+                    new_metric = st.selectbox(
+                        "估值指標",
+                        options=["PE", "PB"],
+                        index=0 if current_metric == "PE" else 1,
+                        help="PE：適合 EPS 穩定正值的公司。PB：適合 EPS 負值、重資產或金融業。",
+                        key=f"metric_sel_{ticker}",
+                    )
+                    fc1, fc2 = st.columns(2)
+                    save_type = fc1.form_submit_button("💾 儲存", use_container_width=True)
+                    reanalyze_btn = fc2.form_submit_button("🔄 重新分析", use_container_width=True)
+
+                    if save_type:
+                        for e in config["watchlist"]:
+                            if e["ticker"] == ticker:
+                                e["type"] = new_type
+                                e["recommended_metric"] = new_metric
+                                e["type_source"] = "manual"
+                                break
+                        save_config(config)
+                        st.cache_data.clear()
+                        st.rerun()
+
+                    if reanalyze_btn:
+                        with st.spinner(f"重新分析 {ticker}..."):
+                            res_a = analyze_suitability(ticker, config["settings"]["data_dir"])
+                        st.session_state[f"pending_reanalyze_{ticker}"] = res_a
+
+                # Show re-analysis result (outside form — buttons cannot nest inside forms)
+                if f"pending_reanalyze_{ticker}" in st.session_state:
+                    res_a = st.session_state[f"pending_reanalyze_{ticker}"]
+                    score_a = res_a.get("suitability_score", 0)
+                    st.info(
+                        f"分析結果：**{TYPE_LABEL.get(res_a.get('type','unknown'), '未知')}**  "
+                        f"｜ 指標：{res_a.get('recommended_metric', 'PE')}  "
+                        f"｜ 適合度：{'⭐' * score_a + '☆' * (5 - score_a)}  \n"
+                        f"{res_a.get('reason', '')}"
+                    )
+                    if st.button("✅ 接受分析結果並儲存", key=f"confirm_ra_{ticker}"):
+                        for e in config["watchlist"]:
+                            if e["ticker"] == ticker:
+                                e["type"] = res_a.get("type", "unknown")
+                                e["type_source"] = "auto"
+                                e["recommended_metric"] = res_a.get("recommended_metric", "PE")
+                                e["suitability_score"] = res_a.get("suitability_score", 0)
+                                e["reason"] = res_a.get("reason", "")
+                                break
+                        save_config(config)
+                        st.cache_data.clear()
+                        del st.session_state[f"pending_reanalyze_{ticker}"]
+                        st.rerun()
 
             with col_b:
                 # Edit holding
@@ -398,7 +513,11 @@ def page_dashboard(config: dict) -> None:
                 "綜合訊號": r.get("composite_display", r.get("signal_display", "N/A")),
                 "技術訊號": _strategy_d_badge(r.get("strategy_d_signal")),
                 "持倉損益%": r.get("holding_pnl_pct"),
-                "⚠️": "EPS 過期" if r.get("eps_stale") else ("" if not r.get("error") else r["error"]),
+                "⚠️": " | ".join(filter(None, [
+                    "EPS 過期" if r.get("eps_stale") else "",
+                    "⚠️ OCF 負值" if (r.get("operating_cashflow") is not None and r["operating_cashflow"] < 0) else "",
+                    r.get("error") or "",
+                ])),
             }
         )
 
@@ -528,6 +647,14 @@ def page_dashboard(config: dict) -> None:
 
 > 以上數據來源：yfinance 分析師共識預估，非公司官方公告，**僅供參考**。
                     """)
+
+            # OCF quality warning
+            ocf = r.get("operating_cashflow")
+            if ocf is not None and ocf < 0:
+                st.warning(
+                    f"⚠️ 營業現金流為負（OCF: ${ocf:,.0f}）｜ 帳面盈利品質存疑，"
+                    "綜合訊號可靠度下降，建議搭配其他財務指標驗證"
+                )
 
             # Strategy D technical signal row
             sd_signal = r.get("strategy_d_signal")

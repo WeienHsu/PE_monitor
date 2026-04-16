@@ -16,6 +16,7 @@ from src.pe_calculator import (
     calc_ttm_eps,
     classify_signal,
     current_percentile_rank,
+    get_ev_ebitda,
     get_forward_pe,
     get_pb_ratio,
     get_pcf_ratio,
@@ -62,6 +63,9 @@ def scan_ticker(ticker: str, config: dict) -> dict:
         "pcf_ratio": None,
         "peg_ratio": None,
         "forward_pe": None,
+        "ev_ebitda": None,
+        "operating_cashflow": None,  # for quality warning (OCF < 0)
+        "stock_type": wl_entry.get("type", "unknown"),
         "composite_factors": {},  # factor_name → +1/0/-1 votes used in composite
     }
 
@@ -127,6 +131,10 @@ def scan_ticker(ticker: str, config: dict) -> dict:
         result["pcf_ratio"] = get_pcf_ratio(ticker, price, data_dir) if price else None
         result["peg_ratio"] = get_peg_ratio(ticker, data_dir)
         result["forward_pe"] = get_forward_pe(ticker, data_dir)
+        result["ev_ebitda"] = get_ev_ebitda(ticker, data_dir)
+        # operating_cashflow for quality warning — free from the same cache
+        from src.data_fetcher import fetch_cashflow as _fc
+        result["operating_cashflow"] = _fc(ticker, data_dir).get("operating_cashflow")
     except Exception:
         pass
 
@@ -150,11 +158,13 @@ def scan_ticker(ticker: str, config: dict) -> dict:
             composite_key, composite_display, factors = compute_multi_factor_composite(
                 pe_sig,
                 sent_label,
+                stock_type=wl_entry.get("type", "unknown"),
                 pcf=result.get("pcf_ratio"),
                 peg=result.get("peg_ratio"),
                 forward_pe=result.get("forward_pe"),
                 trailing_pe=trailing_pe,
                 strategy_d=sd_active,
+                ev_ebitda=result.get("ev_ebitda"),
             )
         else:
             composite_key = pe_sig
@@ -250,9 +260,11 @@ def save_daily_report(results: list[dict], report_dir: str = "reports") -> str:
                 "composite_signal": r.get("composite_signal", r.get("signal", "")),
                 "composite_display": r.get("composite_display", r.get("signal_display", "")),
                 "strategy_d_signal": r.get("strategy_d_signal"),
+                "stock_type": r.get("stock_type", r.get("type", "")),
                 "pcf_ratio": r.get("pcf_ratio"),
                 "peg_ratio": r.get("peg_ratio"),
                 "forward_pe": r.get("forward_pe"),
+                "ev_ebitda": r.get("ev_ebitda"),
             }
         )
     df = pd.DataFrame(rows)

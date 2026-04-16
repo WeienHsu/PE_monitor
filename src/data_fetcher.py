@@ -204,6 +204,7 @@ def fetch_cashflow(ticker: str, data_dir: str = "data") -> dict:
         "peg_ratio": None,
         "forward_pe": None,
         "forward_eps": None,
+        "ev_ebitda": None,
     }
 
     try:
@@ -228,6 +229,10 @@ def fetch_cashflow(ticker: str, data_dir: str = "data") -> dict:
         fcf = info.get("freeCashflow")
         if fcf and fcf != 0:
             result["free_cashflow"] = float(fcf)
+
+        ev_ebitda = info.get("enterpriseToEbitda")
+        if ev_ebitda and ev_ebitda > 0:
+            result["ev_ebitda"] = float(ev_ebitda)
 
         # Fallback: read from annual .cashflow statement if .info is empty
         if result["operating_cashflow"] is None:
