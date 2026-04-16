@@ -80,7 +80,7 @@ def init_config_from_env() -> dict:
             "data_dir": "data",
             "report_dir": "reports",
             "finnhub_api_key": finnhub_api_key,
-            "news_days_lookback": 7,
+            "news_days_lookback": 14,
             "news_weight": 0.3,
         },
     }
@@ -94,7 +94,9 @@ _SETTINGS_DEFAULTS = {
         "n_bars": 3,
         "recovery_pct": 0.7,
         "kd_k_threshold": 20,
-    }
+    },
+    "smtp_enabled": False,
+    "notification_email": "",
 }
 
 

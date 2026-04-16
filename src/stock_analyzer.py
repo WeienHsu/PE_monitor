@@ -140,6 +140,31 @@ def analyze_suitability(ticker: str, data_dir: str = "data") -> dict:
     return result
 
 
+def ensure_watchlist_analyzed(config: dict) -> bool:
+    """
+    Run analyze_suitability() for any watchlist entry whose type is "unknown".
+
+    Updates config entries in-place and saves config.json.
+    Returns True if at least one entry was updated.
+    """
+    from src.utils import save_config  # avoid circular import at module level
+
+    data_dir = config.get("settings", {}).get("data_dir", "data")
+    updated = False
+    for entry in config.get("watchlist", []):
+        if entry.get("type", "unknown") == "unknown":
+            result = analyze_suitability(entry["ticker"], data_dir)
+            entry["name"] = result.get("name") or entry.get("name", "")
+            entry["type"] = result.get("type", "unknown")
+            entry["recommended_metric"] = result.get("recommended_metric", "PE")
+            entry["suitability_score"] = result.get("suitability_score", 0)
+            entry["reason"] = result.get("reason", "")
+            updated = True
+    if updated:
+        save_config(config)
+    return updated
+
+
 TYPE_LABEL = {
     "stable": "穩定型 ✅",
     "growth": "成長型 🟡",

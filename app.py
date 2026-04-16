@@ -25,7 +25,7 @@ from src.pe_calculator import (
 from src.data_fetcher import fetch_price_history
 from src.composite_signal import composite_color
 from src.report_generator import list_report_dates, load_report, scan_all, scan_ticker
-from src.stock_analyzer import TYPE_LABEL, analyze_suitability
+from src.stock_analyzer import TYPE_LABEL, analyze_suitability, ensure_watchlist_analyzed
 from src.utils import (
     add_to_watchlist,
     ensure_dirs,
@@ -456,6 +456,79 @@ def page_dashboard(config: dict) -> None:
             cn2.metric("新聞情緒", _sentiment_badge(r.get("news_sentiment")))
             cn3.metric("綜合訊號", r.get("composite_display", r.get("signal_display", "N/A")))
 
+            # Factor breakdown for composite signal
+            factors: dict = r.get("composite_factors", {})
+            if factors:
+                _FACTOR_BADGE = {1: "🔼", 0: "➡️", -1: "🔽"}
+                badges = "  ".join(
+                    f"{_FACTOR_BADGE.get(v, '?')} **{k}**"
+                    for k, v in factors.items()
+                )
+                sentiment_badge_label = r.get("news_sentiment", {}).get("label", "neutral")
+                sentiment_vote = {"positive": 1, "neutral": 0, "negative": -1}.get(sentiment_badge_label, 0)
+                badges = f"{_FACTOR_BADGE.get(sentiment_vote, '?')} **新聞情緒**  " + badges
+                st.caption(f"因子明細（影響綜合訊號）：{badges}")
+
+            # Supplementary valuation metrics (P/CF, PEG, Forward P/E)
+            pcf = r.get("pcf_ratio")
+            peg = r.get("peg_ratio")
+            fpe = r.get("forward_pe")
+            if any(v is not None for v in [pcf, peg, fpe]):
+                st.markdown("**補充估值指標（參考用）**")
+                supp_cols = st.columns(3)
+                trailing_pe = r.get("metric_value") if r.get("metric_label", "").startswith("PE") else None
+                trailing_pe_str = f"{trailing_pe:.1f}x" if trailing_pe else "N/A"
+
+                supp_cols[0].metric(
+                    "P/CF（市現率）",
+                    f"{pcf:.1f}x" if pcf is not None else "N/A",
+                    help=(
+                        "股價 ÷ 每股營業現金流（Operating Cash Flow per Share）\n\n"
+                        "比 P/E 更難被會計手法調整，適合重資產公司（晶片廠、電信）\n\n"
+                        "• < 10  ➜ 偏低估\n"
+                        "• 10–20 ➜ 合理\n"
+                        "• > 20  ➜ 偏高估"
+                    ),
+                )
+                supp_cols[1].metric(
+                    "PEG 比率",
+                    f"{peg:.2f}" if peg is not None else "N/A",
+                    help=(
+                        "P/E ÷ 預期 EPS 年成長率（分析師共識）\n\n"
+                        "修正高本益比不一定貴的問題，考慮成長速度\n\n"
+                        "• < 1.0 ➜ 相對低估（Peter Lynch 標準）\n"
+                        "• ≈ 1.0 ➜ 合理定價\n"
+                        "• > 2.0 ➜ 相對高估"
+                    ),
+                )
+                supp_cols[2].metric(
+                    "Forward P/E",
+                    f"{fpe:.1f}x" if fpe is not None else "N/A",
+                    help=(
+                        f"股價 ÷ 未來 12 個月預估 EPS（分析師共識）\n\n"
+                        f"目前 Trailing P/E：{trailing_pe_str}\n\n"
+                        "• Forward < Trailing ➜ 市場預期盈餘成長（好兆頭）\n"
+                        "• Forward > Trailing ➜ 市場預期盈餘衰退（警訊）\n"
+                        "• S&P 500 長期均值約 15–17x"
+                    ),
+                )
+
+                with st.expander("📖 補充指標解讀說明", expanded=False):
+                    st.markdown("""
+| 指標 | 公式 | 偏低（較佳） | 偏高（謹慎） |
+|------|------|------------|------------|
+| P/CF | 股價 ÷ 每股 OCF | < 10 | > 20 |
+| PEG  | P/E ÷ EPS 成長率 | < 1.0 | > 2.0 |
+| Forward P/E | 股價 ÷ 預估 EPS | < 15（S&P均值）| > 25 |
+
+**組合解讀：**
+- P/CF 低 + PEG < 1 + Forward P/E < Trailing P/E → 多重低估，強化 BUY 訊號
+- Trailing P/E 低但 P/CF 高 → 帳面 EPS 好看但現金流差，需謹慎
+- PEG > 2 但 Forward P/E 低 → 成長預期大幅下修，請留意
+
+> 以上數據來源：yfinance 分析師共識預估，非公司官方公告，**僅供參考**。
+                    """)
+
             # Strategy D technical signal row
             sd_signal = r.get("strategy_d_signal")
             if sd_signal is not None:
@@ -695,6 +768,18 @@ def page_settings(config: dict) -> None:
 def main() -> None:
     config = load_config()
     ensure_dirs(config)
+
+    # Auto-analyze any watchlist stock that hasn't been classified yet
+    # (e.g. stocks bootstrapped from .env with type="unknown").
+    # Runs once per browser session to avoid re-fetching on every rerun.
+    if "watchlist_analyzed" not in st.session_state:
+        unanalyzed = [e for e in config.get("watchlist", []) if e.get("type", "unknown") == "unknown"]
+        if unanalyzed:
+            with st.spinner(f"首次啟動：分析 {len(unanalyzed)} 檔股票適合度..."):
+                ensure_watchlist_analyzed(config)
+                config = load_config()  # reload with updated entries
+                st.cache_data.clear()
+        st.session_state["watchlist_analyzed"] = True
 
     st.sidebar.title("📊 PE Monitor")
     st.sidebar.markdown("---")

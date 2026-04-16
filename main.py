@@ -10,7 +10,14 @@ and saves the results to reports/daily_YYYYMMDD.csv.
 
 from datetime import datetime
 
-from src.report_generator import save_daily_report, scan_all
+from src.notifier import send_signal_change_email
+from src.report_generator import (
+    _yesterday_date_str,
+    compare_signals,
+    load_report,
+    save_daily_report,
+    scan_all,
+)
 from src.utils import ensure_dirs, load_config
 
 
@@ -81,6 +88,23 @@ def main() -> None:
 
     report_path = save_daily_report(results, config["settings"]["report_dir"])
     print(f"\n報告已儲存：{report_path}")
+
+    # Signal change detection & notification
+    report_dir = config["settings"]["report_dir"]
+    yesterday_df = load_report(_yesterday_date_str(), report_dir)
+    if not yesterday_df.empty:
+        changes = compare_signals(results, yesterday_df)
+        if changes:
+            print(f"\n訊號變更：{len(changes)} 檔")
+            for c in changes:
+                print(f"  {c['ticker']:8s} {c['from_signal']} → {c['to_signal']}")
+            sent = send_signal_change_email(changes, config)
+            if not sent and config["settings"].get("smtp_enabled"):
+                print("  ⚠️  郵件發送失敗，請確認 .env 中的 SMTP_USER / SMTP_PASSWORD")
+        else:
+            print("\n訊號無變化")
+    else:
+        print(f"\n（無昨日報告可比較）")
 
     # Summary counts
     signals = [r.get("signal", "N/A") for r in results if not r.get("error")]
