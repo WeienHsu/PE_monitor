@@ -16,6 +16,7 @@ def _to_tz_naive(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
 
 
 from src.data_fetcher import (
+    fetch_cashflow,
     fetch_info,
     fetch_price_history,
     fetch_quarterly_financials,
@@ -77,6 +78,53 @@ def get_pb_ratio(ticker: str, price: float, data_dir: str = "data") -> float | N
     if bvps and bvps > 0:
         return price / bvps
     return None
+
+
+# ---------------------------------------------------------------------------
+# Supplementary valuation metrics: P/CF, PEG, Forward P/E
+# ---------------------------------------------------------------------------
+
+def get_pcf_ratio(ticker: str, price: float, data_dir: str = "data") -> float | None:
+    """
+    Return P/CF = price / (operating cash flow per share).
+    Uses TTM operating cash flow (total) ÷ shares outstanding.
+    Returns None if cash flow is unavailable or non-positive.
+    """
+    cf_data = fetch_cashflow(ticker, data_dir)
+    ocf = cf_data.get("operating_cashflow")
+    if not ocf or ocf <= 0:
+        return None
+    shares = fetch_shares_outstanding(ticker, data_dir)
+    if not shares or shares <= 0:
+        return None
+    ocf_per_share = ocf / shares
+    if ocf_per_share <= 0:
+        return None
+    return round(price / ocf_per_share, 2)
+
+
+def get_peg_ratio(ticker: str, data_dir: str = "data") -> float | None:
+    """
+    Return analyst consensus PEG ratio from yfinance .info["pegRatio"].
+    Returns None if unavailable or non-positive.
+    """
+    cf_data = fetch_cashflow(ticker, data_dir)
+    peg = cf_data.get("peg_ratio")
+    if peg is None or peg <= 0:
+        return None
+    return round(float(peg), 2)
+
+
+def get_forward_pe(ticker: str, data_dir: str = "data") -> float | None:
+    """
+    Return forward P/E from yfinance .info["forwardPE"].
+    Returns None if unavailable or non-positive.
+    """
+    cf_data = fetch_cashflow(ticker, data_dir)
+    fpe = cf_data.get("forward_pe")
+    if fpe is None or fpe <= 0:
+        return None
+    return round(float(fpe), 2)
 
 
 # ---------------------------------------------------------------------------

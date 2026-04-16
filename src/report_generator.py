@@ -16,10 +16,13 @@ from src.pe_calculator import (
     calc_ttm_eps,
     classify_signal,
     current_percentile_rank,
+    get_forward_pe,
     get_pb_ratio,
+    get_pcf_ratio,
+    get_peg_ratio,
     get_percentiles,
 )
-from src.composite_signal import compute_composite
+from src.composite_signal import compute_composite, compute_multi_factor_composite
 from src.news_fetcher import fetch_news
 from src.sentiment_analyzer import analyze_sentiment, score_articles_individually
 from src.utils import days_since, get_holding, load_config
@@ -56,6 +59,10 @@ def scan_ticker(ticker: str, config: dict) -> dict:
         "last_report_date": None,
         "eps_stale": False,
         "error": None,
+        "pcf_ratio": None,
+        "peg_ratio": None,
+        "forward_pe": None,
+        "composite_factors": {},  # factor_name → +1/0/-1 votes used in composite
     }
 
     # 1. Latest price
@@ -115,6 +122,14 @@ def scan_ticker(ticker: str, config: dict) -> dict:
         result["signal"] = signal
         result["signal_display"] = f"{SIGNAL_EMOJI[signal]} {SIGNAL_LABEL[signal]}"
 
+    # 3.5 Supplementary valuation metrics (never block the primary signal)
+    try:
+        result["pcf_ratio"] = get_pcf_ratio(ticker, price, data_dir) if price else None
+        result["peg_ratio"] = get_peg_ratio(ticker, data_dir)
+        result["forward_pe"] = get_forward_pe(ticker, data_dir)
+    except Exception:
+        pass
+
     # 4. News sentiment & composite signal (always runs, even for ETFs without P/E data)
     try:
         lookback_days = int(settings.get("news_days_lookback", 7))
@@ -125,16 +140,29 @@ def scan_ticker(ticker: str, config: dict) -> dict:
         result["news_articles"] = scored_articles[:3]
         result["news_source"] = news_source
         result["news_status"] = news_status
-        # Composite signal
-        if sentiment.get("available") and result["signal"] not in ("N/A", None):
-            composite_key, composite_display = compute_composite(
-                result["signal"], sentiment["label"]
+        # Composite signal — multi-factor: PE × sentiment + P/CF / PEG / Fwd P/E / Strategy D
+        pe_sig = result["signal"]
+        sent_label = sentiment["label"] if sentiment.get("available") else "neutral"
+        trailing_pe = result.get("metric_value") if (result.get("metric_label") or "").startswith("PE") or result.get("recommended_metric") == "PE" else None
+        sd_active = result.get("strategy_d_signal")  # True / False / None (disabled)
+
+        if pe_sig not in ("N/A", None):
+            composite_key, composite_display, factors = compute_multi_factor_composite(
+                pe_sig,
+                sent_label,
+                pcf=result.get("pcf_ratio"),
+                peg=result.get("peg_ratio"),
+                forward_pe=result.get("forward_pe"),
+                trailing_pe=trailing_pe,
+                strategy_d=sd_active,
             )
         else:
-            composite_key = result["signal"]
+            composite_key = pe_sig
             composite_display = result["signal_display"]
+            factors = {}
         result["composite_signal"] = composite_key
         result["composite_display"] = composite_display
+        result["composite_factors"] = factors
     except Exception:
         result["news_sentiment"] = {"available": False, "score": 0.0, "label": "neutral",
                                     "count": 0, "article_count_by_label": {}, "latest_headline": "",
@@ -144,6 +172,7 @@ def scan_ticker(ticker: str, config: dict) -> dict:
         result["news_status"] = "failed"
         result["composite_signal"] = result["signal"]
         result["composite_display"] = result["signal_display"]
+        result["composite_factors"] = {}
 
     # 5. Strategy D 技術訊號（KD 低檔金叉 + MACD 柱狀圖收斂）
     sd_cfg = settings.get("strategy_d", {})
@@ -221,11 +250,64 @@ def save_daily_report(results: list[dict], report_dir: str = "reports") -> str:
                 "composite_signal": r.get("composite_signal", r.get("signal", "")),
                 "composite_display": r.get("composite_display", r.get("signal_display", "")),
                 "strategy_d_signal": r.get("strategy_d_signal"),
+                "pcf_ratio": r.get("pcf_ratio"),
+                "peg_ratio": r.get("peg_ratio"),
+                "forward_pe": r.get("forward_pe"),
             }
         )
     df = pd.DataFrame(rows)
     df.to_csv(path, index=False, encoding="utf-8-sig")
     return str(path)
+
+
+def _yesterday_date_str() -> str:
+    """Return yesterday's date as YYYYMMDD string."""
+    from datetime import timedelta
+    return (date.today() - timedelta(days=1)).strftime("%Y%m%d")
+
+
+def compare_signals(
+    today_results: list[dict],
+    yesterday_df: pd.DataFrame,
+) -> list[dict]:
+    """
+    Compare today's composite signals against yesterday's saved CSV.
+
+    Returns a list of change dicts for tickers whose composite_signal changed:
+        ticker, name, from_signal, to_signal, current_price,
+        metric_label, metric_value, percentile_rank
+    """
+    if yesterday_df.empty:
+        return []
+
+    # Build lookup: ticker → yesterday's composite_signal
+    prev_signals: dict[str, str] = {}
+    if "ticker" in yesterday_df.columns and "composite_signal" in yesterday_df.columns:
+        for _, row in yesterday_df.iterrows():
+            ticker_val = str(row["ticker"])
+            sig = str(row.get("composite_signal", "") or "")
+            if ticker_val and sig:
+                prev_signals[ticker_val] = sig
+
+    changes = []
+    for r in today_results:
+        ticker_val = r["ticker"]
+        today_sig = r.get("composite_signal") or r.get("signal", "N/A")
+        prev_sig = prev_signals.get(ticker_val)
+        if prev_sig and prev_sig != today_sig and today_sig not in ("N/A", None, ""):
+            changes.append(
+                {
+                    "ticker": ticker_val,
+                    "name": r.get("name", ""),
+                    "from_signal": prev_sig,
+                    "to_signal": today_sig,
+                    "current_price": r.get("price"),
+                    "metric_label": r.get("metric_label") or r.get("recommended_metric", "PE"),
+                    "metric_value": r.get("metric_value"),
+                    "percentile_rank": r.get("percentile_rank"),
+                }
+            )
+    return changes
 
 
 def list_report_dates(report_dir: str = "reports") -> list[str]:

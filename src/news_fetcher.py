@@ -11,7 +11,9 @@ Status codes returned in the result metadata:
   "no_articles"  — Fetch succeeded but returned 0 articles
 """
 
+import hashlib
 import json
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -108,7 +110,7 @@ def _fetch_rss(ticker: str) -> list[dict]:
         url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
         feed = feedparser.parse(url)
         articles = []
-        for entry in (feed.entries or [])[:20]:
+        for entry in (feed.entries or [])[:50]:
             # Convert published tuple → unix timestamp
             pub_ts = 0
             if hasattr(entry, "published_parsed") and entry.published_parsed:
@@ -123,6 +125,55 @@ def _fetch_rss(ticker: str) -> list[dict]:
         return articles
     except Exception:
         return []
+
+
+# ---------------------------------------------------------------------------
+# Deduplication helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_headline(headline: str) -> str:
+    """Lowercase and strip all non-alphanumeric characters for stable comparison."""
+    return re.sub(r"[^a-z0-9]", "", headline.lower())
+
+
+def _deduplicate_articles(
+    articles: list[dict], similarity_threshold: float = 0.85
+) -> list[dict]:
+    """
+    Remove duplicate and near-duplicate articles.
+
+    Two-pass strategy:
+      Pass 1 — exact dedup via MD5 hash of normalized headline.
+      Pass 2 — near-dedup via difflib.SequenceMatcher ratio >= similarity_threshold.
+    """
+    from difflib import SequenceMatcher
+
+    seen_hashes: set[str] = set()
+    seen_normalized: list[str] = []
+    unique: list[dict] = []
+
+    for art in articles:
+        norm = _normalize_headline(art.get("headline", ""))
+        if not norm:
+            unique.append(art)
+            continue
+
+        # Pass 1: exact hash check
+        h = hashlib.md5(norm.encode()).hexdigest()
+        if h in seen_hashes:
+            continue
+
+        # Pass 2: fuzzy similarity against already-accepted headlines
+        is_dup = any(
+            SequenceMatcher(None, norm, existing).ratio() >= similarity_threshold
+            for existing in seen_normalized
+        )
+        if not is_dup:
+            seen_hashes.add(h)
+            seen_normalized.append(norm)
+            unique.append(art)
+
+    return unique
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +238,10 @@ def fetch_news(ticker: str, config: dict, data_dir: str = "data") -> tuple[list[
         else:
             news_source = "none"
             news_status = "failed"
+
+    # Deduplicate before caching
+    if articles:
+        articles = _deduplicate_articles(articles)
 
     # Final no_articles check
     if not articles and news_status == "ok":

@@ -174,3 +174,80 @@ def is_etf(ticker: str, data_dir: str = "data") -> bool:
     info = fetch_info(ticker, data_dir)
     quote_type = (info.get("quoteType") or "").lower()
     return quote_type == "etf"
+
+
+def fetch_cashflow(ticker: str, data_dir: str = "data") -> dict:
+    """
+    Return supplementary valuation fields needed for P/CF, PEG, and Forward P/E.
+
+    Pulls from yfinance .info first (fast, shares cache with fetch_info).
+    Falls back to the annual .cashflow statement if operating cash flow is missing.
+
+    Keys returned (any may be None if unavailable):
+        operating_cashflow  — TTM operating cash flow (total dollars)
+        free_cashflow       — TTM free cash flow (total dollars)
+        peg_ratio           — analyst consensus PEG ratio
+        forward_pe          — forward 12-month P/E (analyst consensus)
+        forward_eps         — forward 12-month EPS (analyst consensus)
+    """
+    cache = _cache_path(data_dir, ticker, "cashflow.json")
+    if not _is_stale(cache, max_age_hours=12):
+        try:
+            with open(cache, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    result: dict = {
+        "operating_cashflow": None,
+        "free_cashflow": None,
+        "peg_ratio": None,
+        "forward_pe": None,
+        "forward_eps": None,
+    }
+
+    try:
+        info = fetch_info(ticker, data_dir)
+
+        peg = info.get("pegRatio") or info.get("trailingPegRatio")
+        if peg and peg > 0:
+            result["peg_ratio"] = float(peg)
+
+        fpe = info.get("forwardPE")
+        if fpe and fpe > 0:
+            result["forward_pe"] = float(fpe)
+
+        feps = info.get("forwardEps")
+        if feps and feps != 0:
+            result["forward_eps"] = float(feps)
+
+        ocf = info.get("operatingCashflow")
+        if ocf and ocf != 0:
+            result["operating_cashflow"] = float(ocf)
+
+        fcf = info.get("freeCashflow")
+        if fcf and fcf != 0:
+            result["free_cashflow"] = float(fcf)
+
+        # Fallback: read from annual .cashflow statement if .info is empty
+        if result["operating_cashflow"] is None:
+            t = yf.Ticker(ticker)
+            cf = t.cashflow  # rows=metrics, cols=dates; annual
+            if cf is not None and not cf.empty:
+                for row_name in ["Operating Cash Flow", "Total Cash From Operating Activities"]:
+                    if row_name in cf.index:
+                        val = cf.loc[row_name].iloc[0]
+                        if pd.notna(val):
+                            result["operating_cashflow"] = float(val)
+                        break
+    except Exception as e:
+        print(f"[data_fetcher] fetch_cashflow {ticker} failed: {e}")
+
+    try:
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+        with open(cache, "w") as f:
+            json.dump(result, f)
+    except Exception:
+        pass
+
+    return result
