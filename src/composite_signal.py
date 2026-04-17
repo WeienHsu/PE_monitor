@@ -182,6 +182,13 @@ def compute_multi_factor_composite(
     ev_ebitda: float | None = None,
 ) -> tuple[str, str, dict]:
     """
+    DEPRECATED — superseded by `src.factors.qvm_composite.compute_qvm`.
+
+    Kept for reference & ad-hoc tooling; not called in the main scan pipeline
+    after the QVM refactor. The QVM composite encodes the same intent (base
+    signal + factor adjustments + sentiment overlay) with a more robust
+    multi-factor valuation input (V) and an explicit quality / trend gate.
+
     Multi-factor composite signal (Plan B: type-adaptive).
 
     Step 1 — base composite: PE signal × news sentiment (existing matrix).

@@ -38,6 +38,47 @@ def _get_annual_eps(ticker: str, data_dir: str = "data") -> list[float]:
     return sorted_vals
 
 
+def classify_etf_subtype(ticker: str, data_dir: str = "data") -> str:
+    """Return one of: broad / sector / dividend / commodity / bond.
+
+    Uses yfinance .info fields — primarily `category`, with `yield` and
+    `longName` as fallbacks.
+    """
+    info = fetch_info(ticker, data_dir)
+    category = (info.get("category") or "").lower()
+    name = (info.get("longName") or ticker).lower()
+
+    def _has(text: str, keywords: list[str]) -> bool:
+        return any(kw in text for kw in keywords)
+
+    if _has(category, ["bond", "treasury", "government", "aggregate", "municipal", "credit"]) \
+            or _has(name, ["bond", "treasury"]):
+        return "bond"
+    if _has(category, ["commodity", "commodities", "precious", "metals"]) \
+            or _has(name, ["gold", "silver", "commodity"]):
+        return "commodity"
+    if _has(category, ["sector", "industry", "industrials", "technology", "semiconductor",
+                        "financial", "energy", "healthcare", "materials", "utilities",
+                        "consumer", "real estate", "reit"]):
+        return "sector"
+
+    # Dividend: yield > 3% for an equity ETF
+    yld = info.get("yield") or info.get("trailingAnnualDividendYield") or 0.0
+    try:
+        if float(yld) > 0.03:
+            return "dividend"
+    except (TypeError, ValueError):
+        pass
+
+    if _has(category, ["blend", "total", "large", "mid", "small", "s&p", "nasdaq",
+                        "world", "global", "emerging", "developed"]) \
+            or _has(name, ["s&p", "total market", "500", "nasdaq", "russell", "世界", "全球"]):
+        return "broad"
+
+    # Default to broad when nothing else matches
+    return "broad"
+
+
 def analyze_suitability(ticker: str, data_dir: str = "data") -> dict:
     """
     Analyse a ticker and return a suitability dict:
@@ -61,12 +102,14 @@ def analyze_suitability(ticker: str, data_dir: str = "data") -> dict:
     if is_etf(ticker, data_dir):
         info = fetch_info(ticker, data_dir)
         name = info.get("longName") or ticker
+        subtype = classify_etf_subtype(ticker, data_dir)
         result.update(
             {
                 "name": name,
                 "type": "etf",
+                "etf_subtype": subtype,
                 "recommended_metric": "PE",
-                "reason": "ETF：成分股混合，P/E 為加權平均，僅供參考",
+                "reason": f"ETF ({subtype})：QVM 採子類型估值替代物",
                 "suitability_score": 3,
             }
         )
@@ -160,6 +203,12 @@ def ensure_watchlist_analyzed(config: dict) -> bool:
             entry["recommended_metric"] = result.get("recommended_metric", "PE")
             entry["suitability_score"] = result.get("suitability_score", 0)
             entry["reason"] = result.get("reason", "")
+            if result.get("etf_subtype"):
+                entry["etf_subtype"] = result["etf_subtype"]
+            updated = True
+        # Backfill missing subtype for previously-analysed ETFs
+        elif entry.get("type") == "etf" and not entry.get("etf_subtype"):
+            entry["etf_subtype"] = classify_etf_subtype(entry["ticker"], data_dir)
             updated = True
     if updated:
         save_config(config)

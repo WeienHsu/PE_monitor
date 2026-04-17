@@ -302,6 +302,49 @@ def current_percentile_rank(value: float, series: pd.Series) -> float:
     return float(rank)
 
 
+def calc_cape_style_pe(
+    ticker: str,
+    price: float,
+    data_dir: str = "data",
+    years: int = 5,
+) -> float | None:
+    """Return CAPE-like P/E = current price / (average TTM EPS over past `years`).
+
+    This is a stock-level analogue of Shiller's CAPE:
+        CAPE = current price / N-year average of TTM earnings.
+
+    We require at least 4 × years quarters of net-income history. Short history
+    or missing shares data → None.
+    """
+    df = fetch_quarterly_financials(ticker, data_dir)
+    if df.empty:
+        return None
+
+    net_income_row = None
+    for name in ["Net Income", "NetIncome", "Net Income Common Stockholders"]:
+        if name in df.index:
+            net_income_row = df.loc[name]
+            break
+    if net_income_row is None:
+        return None
+
+    net_income_row = net_income_row.dropna().sort_index(ascending=False)
+    needed = 4 * years
+    if len(net_income_row) < needed:
+        return None
+
+    shares = fetch_shares_outstanding(ticker, data_dir)
+    if not shares or shares <= 0:
+        return None
+
+    # Average quarterly EPS over `needed` quarters, then annualise by ×4
+    avg_quarterly_ni = float(net_income_row.iloc[:needed].mean())
+    avg_annual_eps = (avg_quarterly_ni * 4.0) / float(shares)
+    if avg_annual_eps <= 0:
+        return None
+    return round(price / avg_annual_eps, 2)
+
+
 def classify_signal(percentile_rank: float, entry: int = 25, exit_: int = 75) -> str:
     """Map a percentile rank to a signal label."""
     if percentile_rank < entry:

@@ -571,22 +571,55 @@ def page_dashboard(config: dict) -> None:
 
             # Composite signal row
             cn1, cn2, cn3 = st.columns(3)
-            cn1.metric("PE 訊號", r.get("signal_display", "N/A"))
+            cn1.metric("QVM 基礎訊號", r.get("signal_display", "N/A"))
             cn2.metric("新聞情緒", _sentiment_badge(r.get("news_sentiment")))
             cn3.metric("綜合訊號", r.get("composite_display", r.get("signal_display", "N/A")))
 
-            # Factor breakdown for composite signal
-            factors: dict = r.get("composite_factors", {})
-            if factors:
-                _FACTOR_BADGE = {1: "🔼", 0: "➡️", -1: "🔽"}
-                badges = "  ".join(
-                    f"{_FACTOR_BADGE.get(v, '?')} **{k}**"
-                    for k, v in factors.items()
-                )
-                sentiment_badge_label = r.get("news_sentiment", {}).get("label", "neutral")
-                sentiment_vote = {"positive": 1, "neutral": 0, "negative": -1}.get(sentiment_badge_label, 0)
-                badges = f"{_FACTOR_BADGE.get(sentiment_vote, '?')} **新聞情緒**  " + badges
-                st.caption(f"因子明細（影響綜合訊號）：{badges}")
+            # QVM 三因子分數（V / Q / M）
+            v_score = r.get("v_score")
+            q_score = r.get("q_score")
+            m_score = r.get("m_score")
+            qvm_raw = r.get("qvm_raw")
+            weights = r.get("qvm_weights", {}) or {}
+            gates = r.get("qvm_gates", {}) or {}
+
+            if any(s is not None for s in [v_score, q_score, m_score]):
+                st.markdown("**QVM 三因子分數**（0-100，越高越好；V = Value／Q = Quality／M = Momentum）")
+                qcols = st.columns(3)
+
+                def _render_factor(col, label, score, weight, details):
+                    if score is None:
+                        col.metric(label, "N/A")
+                        return
+                    col.metric(label, f"{score:.1f}", help=f"權重：{weight * 100:.0f}%")
+                    col.progress(min(100, max(0, int(score))) / 100)
+                    comps = (details or {}).get("components", {})
+                    if comps:
+                        with col.expander("組成細節", expanded=False):
+                            for name, c in comps.items():
+                                raw = c.get("raw")
+                                sc = c.get("score", 0)
+                                if isinstance(raw, (int, float)):
+                                    raw_str = f"{raw:.2f}"
+                                elif isinstance(raw, bool):
+                                    raw_str = "✅" if raw else "—"
+                                else:
+                                    raw_str = str(raw) if raw is not None else "N/A"
+                                st.caption(f"• **{name}**：{raw_str} → {sc:.1f} 分")
+
+                _render_factor(qcols[0], "V (Value) 估值便宜度", v_score, weights.get("V", 0), r.get("v_details"))
+                _render_factor(qcols[1], "Q (Quality) 公司品質", q_score, weights.get("Q", 0), r.get("q_details"))
+                _render_factor(qcols[2], "M (Momentum) 價格動能", m_score, weights.get("M", 0), r.get("m_details"))
+
+                summary_bits = []
+                if qvm_raw is not None:
+                    summary_bits.append(f"**QVM 總分**：{qvm_raw:.1f}")
+                if gates.get("quality"):
+                    summary_bits.append("🚧 品質閘門觸發（OCF ≤ 0 或 TTM EPS ≤ 0 → 封頂為 WATCH）")
+                if gates.get("trend"):
+                    summary_bits.append("📉 趨勢過濾觸發（價格 < SMA200 × 0.85 → BUY 降為 WATCH）")
+                if summary_bits:
+                    st.caption("　　".join(summary_bits))
 
             # Supplementary valuation metrics (P/CF, PEG, Forward P/E)
             pcf = r.get("pcf_ratio")
