@@ -570,10 +570,11 @@ def page_dashboard(config: dict) -> None:
             c4.metric("歷史百分位", f"{r['percentile_rank']:.1f}%" if r.get("percentile_rank") is not None else "N/A")
 
             # Composite signal row
-            cn1, cn2, cn3 = st.columns(3)
+            cn1, cn2, cn3, cn4 = st.columns(4)
             cn1.metric("QVM 基礎訊號", r.get("signal_display", "N/A"))
             cn2.metric("新聞情緒", _sentiment_badge(r.get("news_sentiment")))
             cn3.metric("綜合訊號", r.get("composite_display", r.get("signal_display", "N/A")))
+            cn4.metric("倉位建議", r.get("position_suggestion", "N/A"))
 
             # QVM 三因子分數（V / Q / M）
             v_score = r.get("v_score")

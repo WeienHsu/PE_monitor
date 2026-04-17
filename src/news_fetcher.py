@@ -38,17 +38,20 @@ def _is_stale(path: Path, max_age_hours: int = NEWS_CACHE_TTL_HOURS) -> bool:
 
 def _load_cache(path: Path) -> dict | None:
     try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data
+    except (json.JSONDecodeError, OSError):
+        path.unlink(missing_ok=True)
         return None
 
 
 def _save_cache(path: Path, payload: dict) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        import os
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
     except Exception:
         pass
 

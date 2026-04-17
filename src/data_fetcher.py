@@ -1,14 +1,59 @@
 """
 Fetch stock price and financial data via yfinance.
 Results are cached to data/{ticker}_*.csv to avoid repeated API calls.
+
+Resilience features:
+  - Retry: each network call retries up to 2 times on transient errors.
+  - Stale-cache fallback: if yfinance fails and a cached file exists (even
+    if stale), the stale cache is returned with a warning rather than
+    raising an exception.
+  - Earnings-aware TTL: if the next earnings date is within 1 day, the
+    fundamentals cache TTL is reduced to 1 h to avoid stale-EPS scenarios.
 """
 
 import json
+import os
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
+
+
+def _write_json_atomic(path: Path, data: object) -> None:
+    """Write JSON to a temp file then rename — prevents corrupt caches on interruption."""
+    tmp = path.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _read_json_safe(path: Path) -> object | None:
+    """Read JSON; delete and return None if the file is corrupt."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        path.unlink(missing_ok=True)
+        return None
+
+_RETRY_ATTEMPTS = 2
+_RETRY_DELAY_S = 2.0
+
+
+def _retry(fn, *args, attempts: int = _RETRY_ATTEMPTS, delay: float = _RETRY_DELAY_S, **kwargs):
+    """Call fn(*args, **kwargs) up to `attempts` times on exception."""
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < attempts - 1:
+                time.sleep(delay)
+    raise last_exc
 
 
 def _cache_path(data_dir: str, ticker: str, suffix: str) -> Path:
@@ -20,6 +65,57 @@ def _is_stale(path: Path, max_age_hours: int = 6) -> bool:
         return True
     age = datetime.now() - datetime.fromtimestamp(path.stat().st_mtime)
     return age > timedelta(hours=max_age_hours)
+
+
+# ---------------------------------------------------------------------------
+# Earnings-aware cache TTL
+# ---------------------------------------------------------------------------
+
+def get_next_earnings_date(ticker: str, data_dir: str = "data") -> date | None:
+    """Return the next/most-recent earnings date, or None if unavailable."""
+    cache = _cache_path(data_dir, ticker, "earnings_date.json")
+    if not _is_stale(cache, max_age_hours=24):
+        raw = _read_json_safe(cache)
+        if raw and raw.get("date"):
+            try:
+                return datetime.strptime(raw["date"], "%Y-%m-%d").date()
+            except Exception:
+                pass
+
+    earnings_date: date | None = None
+    try:
+        t = yf.Ticker(ticker)
+        cal = t.calendar
+        if cal is not None and not cal.empty:
+            # calendar index contains "Earnings Date" (or similar)
+            for label in ("Earnings Date", "earnings_date", "Earnings"):
+                if label in cal.index:
+                    val = cal.loc[label]
+                    raw_date = val.iloc[0] if hasattr(val, "iloc") else val
+                    if pd.notna(raw_date):
+                        earnings_date = pd.Timestamp(raw_date).date()
+                    break
+    except Exception:
+        pass
+
+    try:
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(cache, {"date": earnings_date.isoformat() if earnings_date else None})
+    except Exception:
+        pass
+
+    return earnings_date
+
+
+def _fundamentals_ttl_hours(ticker: str, data_dir: str, default_hours: int = 12) -> int:
+    """Return a reduced TTL (1 h) if earnings are within 1 day, else default."""
+    try:
+        ed = get_next_earnings_date(ticker, data_dir)
+        if ed and abs((ed - date.today()).days) <= 1:
+            return 1
+    except Exception:
+        pass
+    return default_hours
 
 
 def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -59,18 +155,24 @@ def _is_valid_price_df(df: pd.DataFrame) -> bool:
 
 
 def fetch_info(ticker: str, data_dir: str = "data") -> dict:
-    """Fetch yfinance .info dict; light cache (6 h)."""
+    """Fetch yfinance .info dict; light cache (6 h). Falls back to stale cache on error."""
     cache = _cache_path(data_dir, ticker, "info.json")
     if not _is_stale(cache):
-        with open(cache, "r") as f:
-            return json.load(f)
+        data = _read_json_safe(cache)
+        if data is not None:
+            return data
+        # File was corrupt — fall through to re-fetch
     try:
-        info = yf.Ticker(ticker).info
+        info = _retry(lambda: yf.Ticker(ticker).info)
         Path(data_dir).mkdir(parents=True, exist_ok=True)
-        with open(cache, "w") as f:
-            json.dump(info, f)
+        _write_json_atomic(cache, info)
         return info
     except Exception as e:
+        if cache.exists():
+            print(f"[data_fetcher] fetch_info {ticker} network failed ({e}); using stale cache")
+            data = _read_json_safe(cache)
+            if data is not None:
+                return data
         print(f"[data_fetcher] fetch_info {ticker} failed: {e}")
         return {}
 
@@ -78,22 +180,35 @@ def fetch_info(ticker: str, data_dir: str = "data") -> dict:
 def fetch_quarterly_financials(ticker: str, data_dir: str = "data") -> pd.DataFrame:
     """
     Return quarterly income statement (rows = metrics, cols = dates).
-    Cached to {ticker}_quarterly_financials.csv (refreshed every 12 h).
+    Cached to {ticker}_quarterly_financials.csv.
+    TTL is 1 h when earnings are within 1 day, otherwise 12 h.
+    Falls back to stale cache on network error.
     """
+    ttl = _fundamentals_ttl_hours(ticker, data_dir, default_hours=12)
     cache = _cache_path(data_dir, ticker, "quarterly_financials.csv")
-    if not _is_stale(cache, max_age_hours=12):
+    if not _is_stale(cache, max_age_hours=ttl):
         return pd.read_csv(cache, index_col=0, parse_dates=True)
     try:
-        t = yf.Ticker(ticker)
-        df = t.quarterly_income_stmt  # rows=metrics, cols=dates
-        if df is None or df.empty:
-            df = t.quarterly_financials
+        def _fetch():
+            t = yf.Ticker(ticker)
+            df = t.quarterly_income_stmt
+            if df is None or df.empty:
+                df = t.quarterly_financials
+            return df
+
+        df = _retry(_fetch)
         if df is None or df.empty:
             return pd.DataFrame()
         Path(data_dir).mkdir(parents=True, exist_ok=True)
         df.to_csv(cache)
         return df
     except Exception as e:
+        if cache.exists():
+            print(f"[data_fetcher] fetch_quarterly_financials {ticker} network failed ({e}); using stale cache")
+            try:
+                return pd.read_csv(cache, index_col=0, parse_dates=True)
+            except Exception:
+                pass
         print(f"[data_fetcher] fetch_quarterly_financials {ticker} failed: {e}")
         return pd.DataFrame()
 
@@ -122,21 +237,32 @@ def fetch_price_history(
     try:
         end = date.today()
         start = end - timedelta(days=365 * years + 30)
-        df = yf.download(
-            ticker,
-            start=start.isoformat(),
-            end=end.isoformat(),
-            progress=False,
-            auto_adjust=True,
-        )
+
+        def _download():
+            return yf.download(
+                ticker,
+                start=start.isoformat(),
+                end=end.isoformat(),
+                progress=False,
+                auto_adjust=True,
+            )
+
+        df = _retry(_download)
         if df is None or df.empty:
             return pd.DataFrame()
-        # Normalise MultiIndex → flat column names before saving
         df = _flatten_columns(df)
         Path(data_dir).mkdir(parents=True, exist_ok=True)
         df.to_csv(cache)
         return df
     except Exception as e:
+        if cache.exists():
+            print(f"[data_fetcher] fetch_price_history {ticker} network failed ({e}); using stale cache")
+            try:
+                stale_df = pd.read_csv(cache, index_col=0, parse_dates=True)
+                if _is_valid_price_df(stale_df):
+                    return stale_df
+            except Exception:
+                pass
         print(f"[data_fetcher] fetch_price_history {ticker} failed: {e}")
         return pd.DataFrame()
 
@@ -190,14 +316,12 @@ def fetch_cashflow(ticker: str, data_dir: str = "data") -> dict:
         forward_pe          — forward 12-month P/E (analyst consensus)
         forward_eps         — forward 12-month EPS (analyst consensus)
     """
+    ttl = _fundamentals_ttl_hours(ticker, data_dir, default_hours=12)
     cache = _cache_path(data_dir, ticker, "cashflow.json")
-    if not _is_stale(cache, max_age_hours=12):
-        try:
-            with open(cache, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-
+    if not _is_stale(cache, max_age_hours=ttl):
+        data = _read_json_safe(cache)
+        if data is not None:
+            return data
     result: dict = {
         "operating_cashflow": None,
         "free_cashflow": None,
@@ -236,8 +360,11 @@ def fetch_cashflow(ticker: str, data_dir: str = "data") -> dict:
 
         # Fallback: read from annual .cashflow statement if .info is empty
         if result["operating_cashflow"] is None:
-            t = yf.Ticker(ticker)
-            cf = t.cashflow  # rows=metrics, cols=dates; annual
+            def _fetch_cf():
+                t = yf.Ticker(ticker)
+                return t.cashflow
+
+            cf = _retry(_fetch_cf)
             if cf is not None and not cf.empty:
                 for row_name in ["Operating Cash Flow", "Total Cash From Operating Activities"]:
                     if row_name in cf.index:
@@ -250,8 +377,7 @@ def fetch_cashflow(ticker: str, data_dir: str = "data") -> dict:
 
     try:
         Path(data_dir).mkdir(parents=True, exist_ok=True)
-        with open(cache, "w") as f:
-            json.dump(result, f)
+        _write_json_atomic(cache, result)
     except Exception:
         pass
 

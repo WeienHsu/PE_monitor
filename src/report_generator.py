@@ -144,6 +144,7 @@ def scan_ticker(ticker: str, config: dict) -> dict:
         "composite_signal": "N/A",
         "composite_display": "N/A",
         "composite_factors": {},
+        "position_suggestion": "N/A",
     }
 
     # ---- 1. Price ----
@@ -354,6 +355,8 @@ def scan_ticker(ticker: str, config: dict) -> dict:
         result["composite_signal"] = qvm_result["composite_signal"]
         result["composite_display"] = qvm_result["composite_display"]
 
+        result["position_suggestion"] = qvm_result.get("position_suggestion", "N/A")
+
         # Factor breakdown for UI (reused field name)
         breakdown: dict[str, float] = {}
         if result["v_score"] is not None:
@@ -436,6 +439,7 @@ def save_daily_report(results: list[dict], report_dir: str = "reports") -> str:
                 "q_score": r.get("q_score"),
                 "m_score": r.get("m_score"),
                 "qvm_raw": r.get("qvm_raw"),
+                "position_suggestion": r.get("position_suggestion", "N/A"),
             }
         )
     df = pd.DataFrame(rows)

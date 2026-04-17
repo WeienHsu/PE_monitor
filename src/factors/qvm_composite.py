@@ -125,6 +125,29 @@ def _apply_trend_filter(
 
 
 # ---------------------------------------------------------------------------
+# Position sizing suggestion
+# ---------------------------------------------------------------------------
+
+_POSITION_MAP: list[tuple[float, str]] = [
+    (BUY_CUT,    "可加碼 10%"),
+    (WATCH_CUT,  "可加碼 5%"),
+    (CAUTION_CUT, "維持現有倉位"),
+    (SELL_CUT,   "建議減倉 5%"),
+    (-1.0,       "建議減倉 10%"),
+]
+
+
+def compute_position_suggestion(qvm_raw: Optional[float]) -> str:
+    """Return a plain-text position-sizing suggestion based on QVM composite score."""
+    if qvm_raw is None:
+        return "N/A"
+    for threshold, label in _POSITION_MAP:
+        if qvm_raw > threshold:
+            return label
+    return "建議減倉 10%"
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -204,4 +227,5 @@ def compute_qvm(
             "trend": trend_triggered,
         },
         "component_signal": pre_gate_signal,
+        "position_suggestion": compute_position_suggestion(qvm_raw),
     }

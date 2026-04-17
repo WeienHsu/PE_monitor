@@ -1,10 +1,12 @@
 """
-Sentiment analysis for news articles using VADER (offline, no GPU required).
+Sentiment analysis for news articles.
 
-VADER compound score ranges:
-  >= +0.05  → positive
-  <= -0.05  → negative
-  otherwise → neutral
+Language routing:
+  - Chinese text (>20% CJK characters) → SnowNLP (offline, no GPU)
+  - English text → VADER (offline, no GPU)
+
+VADER compound score: >= +0.05 positive, <= -0.05 negative, else neutral
+SnowNLP sentiment: 0–1 (mapped to -1 to +1 for consistency)
 
 Time weighting: articles from today get weight 1.0; articles from
 `lookback_days` ago get weight ~0.1 (exponential decay).
@@ -15,7 +17,7 @@ import time
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
-# VADER bootstrap (auto-downloads ~2 MB lexicon on first use)
+# VADER bootstrap
 # ---------------------------------------------------------------------------
 
 def _get_sia():
@@ -30,7 +32,6 @@ def _get_sia():
         return SentimentIntensityAnalyzer()
 
 
-# Singleton so we only instantiate once per process
 _SIA = None
 
 
@@ -42,19 +43,74 @@ def _sia() -> object:
 
 
 # ---------------------------------------------------------------------------
+# SnowNLP bootstrap (optional — graceful fallback to VADER if not installed)
+# ---------------------------------------------------------------------------
+
+_SNOWNLP_AVAILABLE: bool | None = None
+
+
+def _snownlp_available() -> bool:
+    global _SNOWNLP_AVAILABLE
+    if _SNOWNLP_AVAILABLE is None:
+        try:
+            import snownlp  # noqa: F401
+            _SNOWNLP_AVAILABLE = True
+        except ImportError:
+            _SNOWNLP_AVAILABLE = False
+    return _SNOWNLP_AVAILABLE
+
+
+def _score_chinese(text: str) -> float:
+    """Return compound score in [-1, 1] for Chinese text via SnowNLP."""
+    if not text:
+        return 0.0
+    try:
+        from snownlp import SnowNLP
+        # SnowNLP returns 0–1; convert to -1 to +1
+        return (SnowNLP(text).sentiments - 0.5) * 2.0
+    except Exception:
+        return 0.0
+
+
+def _cjk_ratio(text: str) -> float:
+    """Return fraction of characters that are CJK (Chinese/Japanese/Korean)."""
+    if not text:
+        return 0.0
+    cjk = sum(1 for c in text if "\u4e00" <= c <= "\u9fff" or "\u3400" <= c <= "\u4dbf")
+    return cjk / len(text)
+
+
+def _is_chinese(text: str) -> bool:
+    """Return True if text is predominantly Chinese (>20% CJK chars)."""
+    return _cjk_ratio(text) > 0.20
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _score_article(headline: str, summary: str) -> float:
     """
-    Return a compound sentiment score for one article.
+    Return a compound sentiment score for one article in [-1, 1].
     Headline weighted 0.7, summary 0.3.
-    Returns the combined compound float in [-1, 1].
+    Routes to SnowNLP for Chinese text, VADER for English.
     """
-    analyzer = _sia()
-    headline_score = analyzer.polarity_scores(headline or "")["compound"]
-    summary_score = analyzer.polarity_scores(summary or "")["compound"]
-    return 0.7 * headline_score + 0.3 * summary_score
+    headline = headline or ""
+    summary = summary or ""
+
+    # Detect language from headline (longer text → summary, else headline)
+    detect_text = summary if len(summary) > len(headline) else headline
+    use_chinese = _is_chinese(detect_text) and _snownlp_available()
+
+    if use_chinese:
+        h_score = _score_chinese(headline)
+        s_score = _score_chinese(summary)
+    else:
+        analyzer = _sia()
+        h_score = analyzer.polarity_scores(headline)["compound"]
+        s_score = analyzer.polarity_scores(summary)["compound"]
+
+    return 0.7 * h_score + 0.3 * s_score
 
 
 def _time_weight(unix_ts: int, now_ts: float, lookback_days: int) -> float:
