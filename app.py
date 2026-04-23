@@ -28,6 +28,7 @@ from src.report_generator import list_report_dates, load_report, scan_all, scan_
 from src.stock_analyzer import TYPE_LABEL, analyze_suitability, ensure_watchlist_analyzed
 from src.utils import (
     add_to_watchlist,
+    detect_reason_type_mismatch,
     ensure_dirs,
     get_holding,
     load_config,
@@ -36,6 +37,14 @@ from src.utils import (
     save_config,
     upsert_holding,
 )
+
+TYPE_CHINESE = {
+    "stable": "穩定型",
+    "growth": "成長型",
+    "cyclical": "景氣循環型",
+    "etf": "ETF",
+    "unknown": "未知",
+}
 
 st.set_page_config(
     page_title="PE Monitor",
@@ -61,6 +70,52 @@ def _strategy_d_badge(signal) -> str:
     if signal is None:
         return ""
     return "📐 收斂中" if signal else "—"
+
+
+def _render_regime_badge(config: dict) -> None:
+    """
+    Render the market regime badge at the top of the dashboard.
+
+    Shows the current RISK_ON / NEUTRAL / RISK_OFF / UNKNOWN classification
+    with VIX, SPY vs 200MA, and 20-day return details so the user can sanity-
+    check the macro context before reading individual-stock signals.
+    """
+    from src.market_regime import get_market_regime, regime_color, regime_display
+    data_dir = config.get("settings", {}).get("data_dir", "data")
+    try:
+        regime = get_market_regime(data_dir)
+    except Exception as e:
+        st.caption(f"大盤環境偵測失敗：{e}")
+        return
+
+    key = regime.get("regime", "UNKNOWN")
+    bg = regime_color(key) or "#f0f0f0"
+    display = regime_display(key)
+    details: list[str] = []
+    if regime.get("vix") is not None:
+        details.append(f"VIX {regime['vix']}")
+    if regime.get("spy_vs_200ma") is not None:
+        details.append(f"SPY vs 200MA {regime['spy_vs_200ma']*100:+.1f}%")
+    if regime.get("spy_20d_ret") is not None:
+        details.append(f"20日 {regime['spy_20d_ret']*100:+.1f}%")
+    detail_line = "　|　".join(details) if details else "—"
+
+    reasons = regime.get("reasons", [])
+    reasons_html = "；".join(reasons) if reasons else ""
+
+    # Badge
+    st.markdown(
+        f"""
+        <div style='background-color:{bg}; padding:10px 14px; border-radius:8px; margin-bottom:8px;'>
+          <div style='font-size:16px; font-weight:600;'>大盤環境：{display}</div>
+          <div style='font-size:13px; color:#555; margin-top:4px;'>{detail_line}</div>
+          {f"<div style='font-size:12px; color:#666; margin-top:2px;'>{reasons_html}</div>" if reasons_html else ""}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if key == "RISK_OFF":
+        st.caption("⚠️ RISK OFF：個股買進類訊號會自動降一級（避免熊市接刀）。")
 
 
 @st.cache_data(ttl=300)
@@ -355,8 +410,40 @@ def page_watchlist_management(config: dict) -> None:
             with col_a:
                 # Static info
                 type_source = entry.get("type_source", "auto")
-                src_label = {"auto": "🤖 自動", "env": "⚙️ .env 預設", "manual": "✏️ 手動"}.get(type_source, "🤖 自動")
-                st.caption(f"類型來源：{src_label}  ｜  加入日期：{entry.get('added_date', '—')}")
+                src_label = {
+                    "auto":      "🤖 自動",
+                    "hard_rule": "🛡️ 產業規則",   # P2-12 / P2-13
+                    "env":       "⚙️ .env 預設",
+                    "manual":    "✏️ 手動",
+                }.get(type_source, "🤖 自動")
+                small_cap_tag = "  ｜  🏷️ 小型股" if entry.get("small_cap") else ""
+                st.caption(
+                    f"類型來源：{src_label}{small_cap_tag}  ｜  加入日期：{entry.get('added_date', '—')}"
+                )
+
+                # Consistency check: reason text claims type X but entry.type is Y
+                claimed_type = detect_reason_type_mismatch(entry)
+                if claimed_type:
+                    col_warn, col_apply = st.columns([4, 1])
+                    with col_warn:
+                        st.warning(
+                            f"⚠️ 分類已人工覆寫：分析器建議 **{TYPE_CHINESE.get(claimed_type, claimed_type)}**，"
+                            f"但目前設定為 **{TYPE_CHINESE.get(entry.get('type', 'unknown'), '未知')}**。"
+                        )
+                    with col_apply:
+                        # P2-13: 一鍵套用分類器建議（不必先按「重新分析」）
+                        if st.button("✅ 套用建議", key=f"apply_auto_{ticker}", use_container_width=True):
+                            for e in config["watchlist"]:
+                                if e["ticker"] == ticker:
+                                    e["type"] = claimed_type
+                                    e["type_source"] = "auto"
+                                    # Recompute recommended_metric based on the new type
+                                    e["recommended_metric"] = "PB" if claimed_type == "cyclical" else "PE"
+                                    break
+                            save_config(config)
+                            st.cache_data.clear()
+                            st.rerun()
+
                 st.write(f"分析說明：{entry.get('reason', '—')}")
 
                 if holding:
@@ -496,6 +583,9 @@ def page_dashboard(config: dict) -> None:
     with st.spinner("掃描中..."):
         results = cached_scan_all(watchlist_key)
 
+    # --- Market regime badge (top-level context for all signals below) ---
+    _render_regime_badge(config)
+
     # --- Summary table ---
     rows = []
     for r in results:
@@ -516,6 +606,7 @@ def page_dashboard(config: dict) -> None:
                 "⚠️": " | ".join(filter(None, [
                     "EPS 過期" if r.get("eps_stale") else "",
                     "⚠️ OCF 負值" if (r.get("operating_cashflow") is not None and r["operating_cashflow"] < 0) else "",
+                    f"🪤 價值陷阱({(r.get('value_trap') or {}).get('severity', 0)})" if (r.get("value_trap") or {}).get("is_trap") else "",
                     r.get("error") or "",
                 ])),
             }
@@ -588,6 +679,50 @@ def page_dashboard(config: dict) -> None:
                 badges = f"{_FACTOR_BADGE.get(sentiment_vote, '?')} **新聞情緒**  " + badges
                 st.caption(f"因子明細（影響綜合訊號）：{badges}")
 
+            # Type-consistency warning (P2-13): reason disagrees with stored type,
+            # or a hard-rule classification exists but user manually overrode.
+            wl_entry = next((e for e in config.get("watchlist", []) if e["ticker"] == ticker), None)
+            if wl_entry:
+                claimed_type = detect_reason_type_mismatch(wl_entry)
+                if claimed_type:
+                    current_disp = TYPE_CHINESE.get(wl_entry.get("type", "unknown"), "未知")
+                    claimed_disp = TYPE_CHINESE.get(claimed_type, claimed_type)
+                    st.warning(
+                        f"⚠️ **分類可能需要更新**：分析器/產業規則建議 **{claimed_disp}**，"
+                        f"目前設定為 **{current_disp}**。前往「自選股管理」可一鍵套用建議。"
+                    )
+                elif wl_entry.get("type_source") == "hard_rule":
+                    st.caption(
+                        f"🛡️ 類型由產業規則判定（{TYPE_CHINESE.get(wl_entry.get('type'), '?')}）"
+                    )
+                if wl_entry.get("small_cap"):
+                    st.caption("🏷️ **小型股警示**：市值 < $2B，流動性與資料品質可能較差")
+
+            # Value-trap warning (P1-7)
+            vt = r.get("value_trap") or {}
+            if vt.get("flags"):
+                severity = vt.get("severity", 0)
+                flags_html = "；".join(vt["flags"])
+                if vt.get("is_trap"):
+                    st.warning(f"🪤 **價值陷阱警告**（嚴重度 {severity}/4）：{flags_html}\n\n已自動將買進類訊號壓低到 WATCH。")
+                else:
+                    st.info(f"⚠️ 基本面惡化訊號（嚴重度 {severity}/4）：{flags_html}")
+
+            # Position-sizing advice (P1-8)
+            advice = r.get("position_advice") or {}
+            if advice:
+                _ACTION_EMOJI = {
+                    "INITIAL": "🟢 建倉",
+                    "ADD":     "➕ 加碼",
+                    "HOLD":    "⏸️ 續抱",
+                    "TRIM":    "✂️ 減碼",
+                    "EXIT":    "🚪 出清",
+                }
+                act_label = _ACTION_EMOJI.get(advice.get("action"), advice.get("action", ""))
+                size = advice.get("size_pct", 0.0)
+                size_str = f"（{size:.0f}%）" if size else ""
+                st.markdown(f"**建議動作**：{act_label}{size_str}　—　{advice.get('advice', '')}")
+
             # Supplementary valuation metrics (P/CF, PEG, Forward P/E)
             pcf = r.get("pcf_ratio")
             peg = r.get("peg_ratio")
@@ -632,6 +767,132 @@ def page_dashboard(config: dict) -> None:
                     ),
                 )
 
+                # Row 2: type-specific additional metrics
+                stock_type_r = r.get("stock_type", r.get("type", "unknown"))
+                ps_ratio = r.get("ps_ratio")
+                rev_growth = r.get("revenue_growth")
+                div_yield = r.get("dividend_yield")
+                beta = r.get("beta")
+
+                if any(v is not None for v in [ps_ratio, rev_growth, div_yield, beta]):
+                    row2_cols = st.columns(3)
+                    if stock_type_r == "growth":
+                        row2_cols[0].metric(
+                            "P/S（市銷率）",
+                            f"{ps_ratio:.1f}x" if ps_ratio is not None else "N/A",
+                            help=(
+                                "股價 ÷ 每股年營收（Price-to-Sales）\n\n"
+                                "適用於獲利尚不穩定的高成長公司\n\n"
+                                "• < 4  ➜ 偏低估\n"
+                                "• 4–20 ➜ 合理（視產業而異）\n"
+                                "• > 20 ➜ 偏高估\n\n"
+                                "⚠️ P/S 業界差異大：SaaS 平均約 10x，消費品約 2x"
+                            ),
+                        )
+                        rev_str = f"{rev_growth*100:.1f}%" if rev_growth is not None else "N/A"
+                        row2_cols[1].metric(
+                            "營收成長率（YoY）",
+                            rev_str,
+                            help=(
+                                "年營收年增率（來源：yfinance 分析師共識）\n\n"
+                                "• > 15% ➜ 成長論點成立\n"
+                                "• 5–15% ➜ 溫和成長\n"
+                                "• < 5%  ➜ 成長論點減弱，建議重新評估類型"
+                            ),
+                        )
+                        row2_cols[2].metric(
+                            "Beta",
+                            f"{beta:.2f}" if beta is not None else "N/A",
+                            help=(
+                                "相對大盤波動性（Beta = 1 等於大盤）\n\n"
+                                "• < 0.8 ➜ 防禦型（低波動）\n"
+                                "• 0.8–1.2 ➜ 市場中性\n"
+                                "• > 1.5 ➜ 高波動／景氣循環特性"
+                            ),
+                        )
+                    elif stock_type_r == "stable":
+                        div_str = f"{div_yield*100:.2f}%" if div_yield is not None else "N/A"
+                        row2_cols[0].metric(
+                            "股息殖利率",
+                            div_str,
+                            help=(
+                                "年化股息 ÷ 股價（來源：yfinance）\n\n"
+                                "穩定型公司的重要現金回饋指標\n\n"
+                                "• ≥ 2% ➜ 健康（穩定型正面信號）\n"
+                                "• < 0.5% ➜ 過低（若歷史有配息需留意）"
+                            ),
+                        )
+                        row2_cols[1].metric(
+                            "Beta",
+                            f"{beta:.2f}" if beta is not None else "N/A",
+                            help=(
+                                "相對大盤波動性\n\n"
+                                "• < 0.8 ➜ 防禦型，符合穩定股特徵\n"
+                                "• > 1.3 ➜ 偏成長／高波動，考慮重新評估類型"
+                            ),
+                        )
+                        row2_cols[2].metric(
+                            "P/S（市銷率）",
+                            f"{ps_ratio:.1f}x" if ps_ratio is not None else "N/A",
+                            help=(
+                                "股價 ÷ 每股年營收\n\n"
+                                "即使穩定型公司，高 P/S 仍代表估值偏貴\n\n"
+                                "• < 4  ➜ 偏低估\n"
+                                "• > 20 ➜ 偏高估"
+                            ),
+                        )
+                    else:
+                        row2_cols[0].metric(
+                            "Beta",
+                            f"{beta:.2f}" if beta is not None else "N/A",
+                            help=(
+                                "相對大盤波動性（Beta = 1 等於大盤）\n\n"
+                                "• < 0.8 ➜ 防禦型\n"
+                                "• > 1.5 ➜ 高波動／景氣循環特性"
+                            ),
+                        )
+                        row2_cols[1].metric(
+                            "P/S（市銷率）",
+                            f"{ps_ratio:.1f}x" if ps_ratio is not None else "N/A",
+                            help="股價 ÷ 每股年營收，輔助估值參考",
+                        )
+
+                # P3-14: Shiller / Normalized P/E (secondary reference)
+                shiller = r.get("shiller") or {}
+                if shiller.get("available"):
+                    sh_cols = st.columns(3)
+                    sh_pe = shiller.get("shiller_pe")
+                    norm_pe = shiller.get("normalized_pe")
+                    years = shiller.get("years_used", 0)
+                    trailing_pe_val = r.get("metric_value") if (r.get("metric_label") or "").startswith("PE") else None
+                    sh_cols[0].metric(
+                        "Shiller PE（10 年 CAPE）",
+                        f"{sh_pe:.1f}x" if sh_pe is not None else "N/A",
+                        help=(
+                            f"股價 ÷ 10 年平均 EPS（2.5%/年通膨調整後）\n\n"
+                            f"實際使用 {years} 年資料\n\n"
+                            "• 平滑景氣循環中 EPS 峰谷，適合週期股估值\n"
+                            "• 若 Trailing P/E 低但 Shiller PE 高 ➜ 目前 EPS 為循環高點\n"
+                            "• 若 Trailing P/E 高但 Shiller PE 合理 ➜ EPS 暫時受壓"
+                        ),
+                    )
+                    sh_cols[1].metric(
+                        "Normalized PE（未通膨調整）",
+                        f"{norm_pe:.1f}x" if norm_pe is not None else "N/A",
+                        help="同上，但不做通膨調整，純 10 年 EPS 平均",
+                    )
+                    if trailing_pe_val and sh_pe:
+                        diff_pct = (trailing_pe_val - sh_pe) / sh_pe * 100
+                        sh_cols[2].metric(
+                            "Trailing vs Shiller 差",
+                            f"{diff_pct:+.0f}%",
+                            help=(
+                                "Trailing P/E 相對 Shiller PE 的差距：\n\n"
+                                "• 正值大 ➜ 目前 EPS 低於 10 年常態，或市場過度樂觀\n"
+                                "• 負值大 ➜ 目前 EPS 高於 10 年常態，可能處於循環高點"
+                            ),
+                        )
+
                 with st.expander("📖 補充指標解讀說明", expanded=False):
                     st.markdown("""
 | 指標 | 公式 | 偏低（較佳） | 偏高（謹慎） |
@@ -639,11 +900,16 @@ def page_dashboard(config: dict) -> None:
 | P/CF | 股價 ÷ 每股 OCF | < 10 | > 20 |
 | PEG  | P/E ÷ EPS 成長率 | < 1.0 | > 2.0 |
 | Forward P/E | 股價 ÷ 預估 EPS | < 15（S&P均值）| > 25 |
+| P/S  | 股價 ÷ 每股年營收 | < 4（保守）| > 20 |
+| 殖利率 | 年化股息 ÷ 股價 | ≥ 2%（穩定型）| — |
+| Beta | 相對大盤波動性 | < 0.8（防禦）| > 1.5（高波動）|
 
 **組合解讀：**
 - P/CF 低 + PEG < 1 + Forward P/E < Trailing P/E → 多重低估，強化 BUY 訊號
 - Trailing P/E 低但 P/CF 高 → 帳面 EPS 好看但現金流差，需謹慎
 - PEG > 2 但 Forward P/E 低 → 成長預期大幅下修，請留意
+- 成長股：P/S 高但營收成長 > 15% → 成長溢價合理
+- 穩定股：殖利率 ≥ 2% + Beta < 0.8 → 符合穩定型特徵
 
 > 以上數據來源：yfinance 分析師共識預估，非公司官方公告，**僅供參考**。
                     """)

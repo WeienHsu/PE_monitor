@@ -177,10 +177,39 @@ def _deduplicate_articles(
 
 
 # ---------------------------------------------------------------------------
+# Relevance filtering helpers
+# ---------------------------------------------------------------------------
+
+def _build_ticker_tokens(ticker: str, company_name: str) -> set[str]:
+    """
+    Return a set of keyword tokens that should appear in a relevant article.
+    Includes the ticker symbol and significant words from the company name.
+    """
+    tokens: set[str] = {ticker.upper(), ticker.lower()}
+    for word in (company_name or "").split():
+        clean = re.sub(r"[^a-zA-Z0-9]", "", word)
+        if len(clean) >= 5:
+            tokens.add(clean.lower())
+    return tokens
+
+
+def _is_company_relevant(article: dict, ticker: str, company_name: str) -> bool:
+    """
+    Return True if the article headline or summary mentions the company.
+    Filters out macro/market-wide news that dilutes stock-specific sentiment.
+    """
+    tokens = _build_ticker_tokens(ticker, company_name)
+    text = (
+        (article.get("headline") or "") + " " + (article.get("summary") or "")
+    ).lower()
+    return any(t.lower() in text for t in tokens)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def fetch_news(ticker: str, config: dict, data_dir: str = "data") -> tuple[list[dict], str, str]:
+def fetch_news(ticker: str, config: dict, data_dir: str = "data", company_name: str = "") -> tuple[list[dict], str, str]:
     """
     Fetch news for *ticker* using Finnhub (primary) or Yahoo Finance RSS (fallback).
 
@@ -242,6 +271,13 @@ def fetch_news(ticker: str, config: dict, data_dir: str = "data") -> tuple[list[
     # Deduplicate before caching
     if articles:
         articles = _deduplicate_articles(articles)
+
+    # Relevance filter: keep only articles mentioning the company
+    # Applied only when >5 articles available (to avoid empty-after-filter edge case)
+    if articles and len(articles) > 5 and (ticker or company_name):
+        relevant = [a for a in articles if _is_company_relevant(a, ticker, company_name)]
+        if relevant:
+            articles = relevant
 
     # Final no_articles check
     if not articles and news_status == "ok":

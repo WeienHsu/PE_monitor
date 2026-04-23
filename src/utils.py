@@ -225,3 +225,45 @@ def days_since(date_str: str) -> int:
         return (date.today() - d).days
     except Exception:
         return 9999
+
+
+_REASON_TYPE_KEYWORDS = {
+    "stable": "穩定型",
+    "growth": "成長型",
+    "cyclical": "景氣循環型",
+    "etf": "ETF",
+}
+
+
+def detect_reason_type_mismatch(entry: dict) -> str | None:
+    """
+    Return the auto-classifier's type as embedded in `entry["reason"]` when it
+    disagrees with the stored `entry["type"]` (indicating manual override).
+    Returns None when they agree or the reason string lacks a classification phrase.
+
+    The reason string format from analyze_suitability() ends with
+    "...判定為<type>型，..." or contains "ETF：" at the start.
+    """
+    current_type = (entry.get("type") or "").strip()
+    reason = entry.get("reason") or ""
+    if not current_type or not reason:
+        return None
+
+    # Find which type the reason text claims
+    claimed: str | None = None
+    # "判定為 XXX 型" pattern — accept both with and without spaces
+    for t, keyword in _REASON_TYPE_KEYWORDS.items():
+        if t == "etf":
+            # ETF reason is typically "ETF：..." prefix
+            if reason.startswith("ETF"):
+                claimed = "etf"
+                break
+        elif f"判定為{keyword}" in reason:
+            claimed = t
+            break
+
+    if claimed is None:
+        return None
+    if claimed == current_type:
+        return None
+    return claimed

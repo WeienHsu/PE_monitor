@@ -7,12 +7,13 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.data_fetcher import get_latest_close, is_etf
+from src.data_fetcher import fetch_earnings_dates, fetch_fundamental_extras, get_latest_close, is_etf
 from src.pe_calculator import (
     SIGNAL_EMOJI,
     SIGNAL_LABEL,
     build_historical_pb_series,
     build_historical_pe_series,
+    calc_shiller_pe,
     calc_ttm_eps,
     classify_signal,
     current_percentile_rank,
@@ -22,23 +23,36 @@ from src.pe_calculator import (
     get_pcf_ratio,
     get_peg_ratio,
     get_percentiles,
+    get_ps_ratio,
 )
 from src.composite_signal import compute_composite, compute_multi_factor_composite
+from src.market_regime import get_market_regime
+from src.momentum_factors import get_momentum_factors
 from src.news_fetcher import fetch_news
+from src.position_sizing import suggest_position
 from src.sentiment_analyzer import analyze_sentiment, score_articles_individually
 from src.utils import days_since, get_holding, load_config
+from src.value_trap_filter import check_value_trap
 
 
-def scan_ticker(ticker: str, config: dict) -> dict:
+def scan_ticker(ticker: str, config: dict, market_regime: dict | None = None) -> dict:
     """
     Run a full P/E (or P/B) scan for a single ticker.
     Returns a result dict with all display fields.
+
+    Parameters
+    ----------
+    ticker        : stock symbol
+    config        : loaded config dict (watchlist + settings)
+    market_regime : optional regime dict from get_market_regime().  If None,
+                    regime filter is disabled (legacy behaviour).
     """
     settings = config["settings"]
     data_dir = settings["data_dir"]
     years = settings.get("pe_history_years", 5)
     entry_pct = settings.get("entry_percentile", 25)
     exit_pct = settings.get("exit_percentile", 75)
+    regime_key = (market_regime or {}).get("regime") if market_regime else None
 
     # Find watchlist entry
     wl_entry = next((e for e in config["watchlist"] if e["ticker"] == ticker), {})
@@ -65,6 +79,10 @@ def scan_ticker(ticker: str, config: dict) -> dict:
         "forward_pe": None,
         "ev_ebitda": None,
         "operating_cashflow": None,  # for quality warning (OCF < 0)
+        "ps_ratio": None,
+        "revenue_growth": None,
+        "dividend_yield": None,
+        "beta": None,
         "stock_type": wl_entry.get("type", "unknown"),
         "composite_factors": {},  # factor_name → +1/0/-1 votes used in composite
     }
@@ -117,12 +135,17 @@ def scan_ticker(ticker: str, config: dict) -> dict:
                     result["eps_stale"] = True
                 history = build_historical_pe_series(ticker, years=years, data_dir=data_dir)
 
-    # 3. Percentiles & signal
+    # 3. Percentiles & signal (type-adaptive thresholds per P1-9)
     if not skip_metric and history is not None and not history.empty:
         result["percentiles"] = get_percentiles(history)
         rank = current_percentile_rank(result["metric_value"], history)
         result["percentile_rank"] = round(rank, 1)
-        signal = classify_signal(rank, entry=entry_pct, exit_=exit_pct)
+        signal = classify_signal(
+            rank,
+            entry=entry_pct,
+            exit_=exit_pct,
+            stock_type=wl_entry.get("type"),
+        )
         result["signal"] = signal
         result["signal_display"] = f"{SIGNAL_EMOJI[signal]} {SIGNAL_LABEL[signal]}"
 
@@ -132,18 +155,76 @@ def scan_ticker(ticker: str, config: dict) -> dict:
         result["peg_ratio"] = get_peg_ratio(ticker, data_dir)
         result["forward_pe"] = get_forward_pe(ticker, data_dir)
         result["ev_ebitda"] = get_ev_ebitda(ticker, data_dir)
+        result["ps_ratio"] = get_ps_ratio(ticker, data_dir)
         # operating_cashflow for quality warning — free from the same cache
         from src.data_fetcher import fetch_cashflow as _fc
         result["operating_cashflow"] = _fc(ticker, data_dir).get("operating_cashflow")
+        # New fundamental extras: beta, revenue_growth, dividend_yield
+        extras = fetch_fundamental_extras(ticker, data_dir)
+        result["revenue_growth"] = extras.get("revenue_growth")
+        result["dividend_yield"] = extras.get("dividend_yield")
+        result["beta"] = extras.get("beta")
     except Exception:
         pass
+
+    # 3.55 Shiller / Normalized P/E (P3-14) — informational, secondary signal.
+    # Skip for ETFs (earnings concept doesn't apply to a basket) and when we
+    # can't determine price (primary-signal failure already reported above).
+    shiller = {
+        "available": False,
+        "shiller_pe": None,
+        "normalized_pe": None,
+        "normalized_eps": None,
+        "years_used": 0,
+        "reason": "",
+    }
+    if price is not None and (wl_entry.get("type") or "").lower() != "etf":
+        try:
+            shiller = calc_shiller_pe(ticker, price=price, data_dir=data_dir)
+        except Exception as e:
+            print(f"[report_generator] Shiller P/E {ticker} failed: {e}")
+    result["shiller"] = shiller
+
+    # 3.6 Value-trap diagnosis (skip ETFs)
+    value_trap = {"is_trap": False, "severity": 0, "flags": []}
+    if (wl_entry.get("type") or "").lower() != "etf":
+        try:
+            value_trap = check_value_trap(ticker, data_dir)
+        except Exception as e:
+            print(f"[report_generator] value-trap check {ticker} failed: {e}")
+    result["value_trap"] = value_trap
+
+    # 3.7 Momentum factors (P2-11): volume surge + 52w position
+    momentum = {
+        "volume": {"ratio": None, "vote": 0, "available": False},
+        "position_52w": {"position": None, "high": None, "low": None, "vote": 0, "available": False},
+    }
+    try:
+        momentum = get_momentum_factors(ticker, data_dir)
+    except Exception as e:
+        print(f"[report_generator] momentum factors {ticker} failed: {e}")
+    result["momentum"] = momentum
 
     # 4. News sentiment & composite signal (always runs, even for ETFs without P/E data)
     try:
         lookback_days = int(settings.get("news_days_lookback", 7))
-        articles, news_source, news_status = fetch_news(ticker, config, data_dir)
-        sentiment = analyze_sentiment(articles, lookback_days=lookback_days)
-        scored_articles = score_articles_individually(articles, lookback_days=lookback_days)
+        articles, news_source, news_status = fetch_news(ticker, config, data_dir, company_name=wl_entry.get("name", ""))
+        # P3-17: earnings pulse weighting — fetch known earnings dates so
+        # articles within ±3 days get 2× weight in the sentiment aggregate.
+        try:
+            earnings_dates = fetch_earnings_dates(ticker, data_dir)
+        except Exception:
+            earnings_dates = []
+        sentiment = analyze_sentiment(
+            articles,
+            lookback_days=lookback_days,
+            earnings_dates=earnings_dates,
+        )
+        scored_articles = score_articles_individually(
+            articles,
+            lookback_days=lookback_days,
+            earnings_dates=earnings_dates,
+        )
         result["news_sentiment"] = sentiment
         result["news_articles"] = scored_articles[:3]
         result["news_source"] = news_source
@@ -155,6 +236,9 @@ def scan_ticker(ticker: str, config: dict) -> dict:
         sd_active = result.get("strategy_d_signal")  # True / False / None (disabled)
 
         if pe_sig not in ("N/A", None):
+            vol_vote = (momentum.get("volume") or {}).get("vote") if (momentum.get("volume") or {}).get("available") else None
+            pos_vote = (momentum.get("position_52w") or {}).get("vote") if (momentum.get("position_52w") or {}).get("available") else None
+            sent_score = sentiment.get("score") if sentiment.get("available") else None
             composite_key, composite_display, factors = compute_multi_factor_composite(
                 pe_sig,
                 sent_label,
@@ -165,6 +249,14 @@ def scan_ticker(ticker: str, config: dict) -> dict:
                 trailing_pe=trailing_pe,
                 strategy_d=sd_active,
                 ev_ebitda=result.get("ev_ebitda"),
+                ps=result.get("ps_ratio"),
+                revenue_growth=result.get("revenue_growth"),
+                dividend_yield=result.get("dividend_yield"),
+                market_regime=regime_key,
+                value_trap_severity=value_trap.get("severity", 0),
+                volume_vote=vol_vote,
+                position_52w_vote=pos_vote,
+                sentiment_score=sent_score,
             )
         else:
             composite_key = pe_sig
@@ -209,9 +301,26 @@ def scan_ticker(ticker: str, config: dict) -> dict:
 def scan_all(config: dict) -> list[dict]:
     """Scan all tickers in the watchlist and return list of result dicts."""
     tickers = [e["ticker"] for e in config.get("watchlist", [])]
+    # Fetch market regime once per scan (cached 24h) — shared by all tickers
+    data_dir = config.get("settings", {}).get("data_dir", "data")
+    try:
+        regime = get_market_regime(data_dir)
+    except Exception as e:
+        print(f"[report_generator] get_market_regime failed: {e}")
+        regime = None
     results = []
     for ticker in tickers:
-        r = scan_ticker(ticker, config)
+        r = scan_ticker(ticker, config, market_regime=regime)
+        if regime:
+            r["market_regime"] = regime.get("regime")
+            r["market_regime_reasons"] = regime.get("reasons", [])
+        # Position sizing recommendation — needs holding + composite signal
+        holding = get_holding(config, ticker)
+        r["position_advice"] = suggest_position(
+            r.get("composite_signal") or r.get("signal") or "NEUTRAL",
+            percentile_rank=r.get("percentile_rank"),
+            holding_shares=(holding or {}).get("shares"),
+        )
         # Attach holding info
         holding = get_holding(config, ticker)
         if holding:
@@ -265,6 +374,18 @@ def save_daily_report(results: list[dict], report_dir: str = "reports") -> str:
                 "peg_ratio": r.get("peg_ratio"),
                 "forward_pe": r.get("forward_pe"),
                 "ev_ebitda": r.get("ev_ebitda"),
+                "ps_ratio": r.get("ps_ratio"),
+                "revenue_growth": r.get("revenue_growth"),
+                "dividend_yield": r.get("dividend_yield"),
+                "beta": r.get("beta"),
+                "value_trap_severity": (r.get("value_trap") or {}).get("severity", 0),
+                "value_trap_flags": "; ".join((r.get("value_trap") or {}).get("flags", [])),
+                "market_regime": r.get("market_regime"),
+                "volume_ratio": ((r.get("momentum") or {}).get("volume") or {}).get("ratio"),
+                "position_52w": ((r.get("momentum") or {}).get("position_52w") or {}).get("position"),
+                "shiller_pe": (r.get("shiller") or {}).get("shiller_pe"),
+                "normalized_pe": (r.get("shiller") or {}).get("normalized_pe"),
+                "shiller_years": (r.get("shiller") or {}).get("years_used"),
             }
         )
     df = pd.DataFrame(rows)
